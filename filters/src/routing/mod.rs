@@ -11,9 +11,11 @@
 mod credential_inject;
 pub(crate) mod descriptor;
 mod intelligent_route;
+pub(crate) mod load;
 pub(crate) mod metadata;
 pub(crate) mod overlay;
 mod provider_route;
+pub(crate) mod scoring;
 
 pub use credential_inject::CredentialInjectFilter;
 pub use intelligent_route::IntelligentRouteFilter;

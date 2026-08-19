@@ -36,12 +36,14 @@ use serde::Deserialize;
 
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    load,
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
         ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_TIER, ROUTE_SITE,
         ROUTE_STABLE_ID, SELECTED_CANDIDATE_HEADER, set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, RouteSnapshot},
+    scoring,
 };
 
 // -----------------------------------------------------------------------------
@@ -95,6 +97,11 @@ const MAX_TTL_SECS: u64 = 86_400;
 struct IntelligentRouteConfig {
     /// Static list of route candidates (mutually exclusive with `overlay_file`).
     candidates: Option<Vec<CandidateConfig>>,
+
+    /// Live load signals polled from the local grid operator.
+    ///
+    /// Absent by default, in which case selection is the overlay order alone.
+    load: Option<load::LoadConfig>,
 
     /// Name of the local site (required in static mode, provided by overlay
     /// in overlay mode).
@@ -410,6 +417,16 @@ pub struct IntelligentRouteFilter {
     session_affinity: Option<SessionAffinity>,
     /// Atomic snapshot of routing state (candidates + `local_site`).
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    /// Live load signals, when configured.
+    load: Option<LoadRouting>,
+}
+
+/// Live load signals and the scorers reading them.
+struct LoadRouting {
+    /// Scorers applied to every admitted candidate set.
+    scorers: Vec<Box<dyn scoring::Scorer>>,
+    /// Held so the poll loop stops when the filter is dropped.
+    _collector: load::LoadCollector,
 }
 
 impl IntelligentRouteFilter {
@@ -455,6 +472,7 @@ impl IntelligentRouteFilter {
 
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
+        let load = cfg.load.map(build_load_routing).transpose()?;
 
         Ok(Box::new(Self {
             model_header,
@@ -462,6 +480,7 @@ impl IntelligentRouteFilter {
             provider_hop_clusters,
             session_affinity,
             snapshot,
+            load,
         }))
     }
 
@@ -493,7 +512,7 @@ impl IntelligentRouteFilter {
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
-        let Some(c) = select_admitted(&snap.candidates, kind, name) else {
+        let Some(c) = select_admitted(&snap.candidates, kind, name, self.load.as_ref()) else {
             tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
@@ -509,6 +528,30 @@ impl IntelligentRouteFilter {
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Start the load collector described by `config`.
+fn build_load_routing(config: load::LoadConfig) -> Result<LoadRouting, FilterError> {
+    if config.queue_metric.trim().is_empty() {
+        return Err("intelligent_route: load.queue_metric must not be blank".into());
+    }
+    if config.interval_ms == 0 {
+        return Err("intelligent_route: load.interval_ms must be greater than zero".into());
+    }
+    let (store, collector) = load::spawn(&config)?;
+    let scorers: Vec<Box<dyn scoring::Scorer>> = vec![Box::new(scoring::QueueScorer {
+        store,
+        metric: config.queue_metric.into_boxed_str(),
+        max_age_ms: config.max_age_ms,
+    })];
+    tracing::info!(
+        scorers = scorers.iter().map(|s| s.name()).collect::<Vec<_>>().join(","),
+        "intelligent_route: live load scoring enabled"
+    );
+    Ok(LoadRouting {
+        scorers,
+        _collector: collector,
+    })
 }
 
 /// Return type for snapshot builders: shared snapshot + optional watcher.
@@ -919,17 +962,18 @@ fn select_admitted<'a>(
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
+    load: Option<&LoadRouting>,
 ) -> Option<&'a RouteCandidate> {
-    for c in candidates {
-        if c.kind != kind || &*c.name != name {
-            continue;
-        }
-        if !is_admitted_for_new_request(c.admission_state) {
-            continue;
-        }
-        return Some(c);
-    }
-    None
+    let admitted: Vec<&RouteCandidate> = candidates
+        .iter()
+        .filter(|c| c.kind == kind && &*c.name == name && is_admitted_for_new_request(c.admission_state))
+        .collect();
+    let first = admitted.first().copied();
+    let Some(load) = load else {
+        return first;
+    };
+    let scores = scoring::score_all(&load.scorers, &admitted, load::now_ms());
+    scoring::pick(&admitted, &scores).or(first)
 }
 
 /// Whether a candidate passes admission filtering.
@@ -1628,6 +1672,7 @@ mod tests {
     async fn on_request_after_snapshot_swap() {
         let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
         let filter = IntelligentRouteFilter {
+            load: None,
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),
@@ -1780,6 +1825,7 @@ mod tests {
             "site-a",
         )));
         let filter = IntelligentRouteFilter {
+            load: None,
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),
@@ -2448,6 +2494,7 @@ mod tests {
             "provider-gateway",
         )])));
         let filter = IntelligentRouteFilter {
+            load: None,
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
@@ -2494,6 +2541,7 @@ mod tests {
         let expected_rev = snap.semantic_revision.clone().unwrap();
         let shared = Arc::new(ArcSwap::from_pointee(snap));
         let filter = IntelligentRouteFilter {
+            load: None,
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
@@ -2745,6 +2793,7 @@ mod tests {
         session_affinity: Option<SessionAffinity>,
     ) -> IntelligentRouteFilter {
         IntelligentRouteFilter {
+            load: None,
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),

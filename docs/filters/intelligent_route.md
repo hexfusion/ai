@@ -55,6 +55,14 @@ Supports two modes:
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
+| `load` | LoadConfig | no | Live load signals polled from the local grid operator. Absent by default, in which case selection is the overlay order alone. |
+| `load.endpoint` | string | yes | Grid scope on the local operator, e.g. `http://grid-operator:9091/grid`. The `/grid` scope carries this site and its peers. `/federate` carries one site and is what peer operators read, so pointing here at that instead would leave every remote candidate unscored. |
+| `load.queue_metric` | string | yes | Metric name that carries queue depth. Named here rather than assumed, because the operator republishes what a provider exposes and providers do not agree on what to call it. |
+| `load.select` | string[] | no | Selectors sent as `match[]`, narrowing what the operator returns. |
+| `load.interval_ms` | integer | no | Poll interval in milliseconds. |
+| `load.window_secs` | integer | no | Retention per series in seconds. |
+| `load.max_age_ms` | integer | no | Age past which a sample is ignored for routing, in milliseconds. A liveness bound rather than a freshness score: it stops a dead operator from pinning routing to values that stopped describing anything, and it does not otherwise rank one candidate above another. |
+| `load.timeout_ms` | integer | no | Request timeout in milliseconds. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
