@@ -56,9 +56,9 @@ Supports two modes:
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `load` | LoadConfig | no | Live load signals polled from the local grid operator. Absent by default, in which case selection is the overlay order alone. |
-| `load.endpoint` | string | yes | Grid scope on the local operator, e.g. `http://grid-operator:9091/grid`. The `/grid` scope carries this site and its peers. `/federate` carries one site and is what peer operators read, so pointing here at that instead would leave every remote candidate unscored. |
+| `load.endpoint` | string | yes | Signals endpoint on the local operator, e.g. `http://grid-operator:9091/metrics`. Unqualified, this carries the local site and every peer the operator has collected. Adding `?target=<site>` narrows it to one site, which is what peer operators ask for, so pointing here at that instead would leave every remote candidate unscored. |
 | `load.queue_metric` | string | yes | Metric name that carries queue depth. Named here rather than assumed, because the operator republishes what a provider exposes and providers do not agree on what to call it. |
-| `load.select` | string[] | no | Selectors sent as `match[]`, narrowing what the operator returns. |
+| `load.collect` | string[] | no | Metric names sent as `collect[]`, narrowing what the operator returns. These are bare names, not selectors. The operator filters by metric name only, so a label matcher here would match nothing and silently drop the series it was meant to narrow. |
 | `load.interval_ms` | integer | no | Poll interval in milliseconds. |
 | `load.window_secs` | integer | no | Retention per series in seconds. |
 | `load.max_age_ms` | integer | no | Age past which a sample is ignored for routing, in milliseconds. A liveness bound rather than a freshness score: it stops a dead operator from pinning routing to values that stopped describing anything, and it does not otherwise rank one candidate above another. |

@@ -44,11 +44,13 @@ const MAX_SERIES: usize = 4_096;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoadConfig {
-    /// Grid scope on the local operator, e.g. `http://grid-operator:9091/grid`.
+    /// Signals endpoint on the local operator, e.g.
+    /// `http://grid-operator:9091/metrics`.
     ///
-    /// The `/grid` scope carries this site and its peers. `/federate` carries
-    /// one site and is what peer operators read, so pointing here at that
-    /// instead would leave every remote candidate unscored.
+    /// Unqualified, this carries the local site and every peer the operator has
+    /// collected. Adding `?target=<site>` narrows it to one site, which is what
+    /// peer operators ask for, so pointing here at that instead would leave
+    /// every remote candidate unscored.
     pub endpoint: String,
 
     /// Metric name that carries queue depth.
@@ -57,9 +59,13 @@ pub(crate) struct LoadConfig {
     /// provider exposes and providers do not agree on what to call it.
     pub queue_metric: String,
 
-    /// Selectors sent as `match[]`, narrowing what the operator returns.
+    /// Metric names sent as `collect[]`, narrowing what the operator returns.
+    ///
+    /// These are bare names, not selectors. The operator filters by metric name
+    /// only, so a label matcher here would match nothing and silently drop the
+    /// series it was meant to narrow.
     #[serde(default)]
-    pub select: Vec<String>,
+    pub collect: Vec<String>,
 
     /// Poll interval in milliseconds.
     #[serde(default = "default_interval_ms")]
@@ -178,8 +184,13 @@ impl LoadStore {
 
     /// Most recent sample of `metric` for `key`, if it is younger than `max_age_ms`.
     pub fn fresh(&self, key: &str, metric: &str, now_ms: i64, max_age_ms: i64) -> Option<Sample> {
+        // The range starts at zero deliberately. A sample stamped in the future
+        // means the publishing site's clock is ahead of this one, and a negative
+        // age would otherwise compare as fresh forever, letting a site that has
+        // stopped reporting keep winning on its last value. An unusable reading
+        // is withheld, which costs a fallback to the rendered order.
         self.latest(key, metric)
-            .filter(|s| now_ms.saturating_sub(s.at_ms) <= max_age_ms)
+            .filter(|s| (0..=max_age_ms).contains(&now_ms.saturating_sub(s.at_ms)))
     }
 
     /// Number of providers held.
@@ -295,7 +306,7 @@ impl Drop for LoadCollector {
 /// indefinitely.
 pub(crate) fn spawn(config: &LoadConfig) -> Result<(Arc<LoadStore>, LoadCollector), FilterError> {
     let store = Arc::new(LoadStore::new(Duration::from_secs(config.window_secs)));
-    let url = build_url(&config.endpoint, &config.select);
+    let url = build_url(&config.endpoint, &config.collect);
     let interval = Duration::from_millis(config.interval_ms);
     let timeout = Duration::from_millis(config.timeout_ms);
     let cancel = CancellationToken::new();
@@ -356,14 +367,14 @@ async fn poll_once(client: &reqwest::Client, url: &str, store: &LoadStore) {
     }
 }
 
-/// Append `match[]` parameters for each selector.
-fn build_url(endpoint: &str, select: &[String]) -> String {
-    if select.is_empty() {
+/// Append `collect[]` parameters for each metric name.
+fn build_url(endpoint: &str, collect: &[String]) -> String {
+    if collect.is_empty() {
         return endpoint.to_owned();
     }
-    let query = select
+    let query = collect
         .iter()
-        .map(|s| format!("match[]={}", encode(s)))
+        .map(|s| format!("collect[]={}", encode(s)))
         .collect::<Vec<_>>()
         .join("&");
     let separator = if endpoint.contains('?') { '&' } else { '?' };
@@ -499,18 +510,29 @@ mod tests {
     }
 
     #[test]
-    fn selectors_become_match_parameters() {
-        let url = build_url(
-            "http://operator:9091/federate",
-            &[format!(r#"{QUEUE}{{grid_site="east"}}"#)],
+    fn a_sample_from_a_clock_ahead_of_ours_is_withheld() {
+        let store = store();
+        store.ingest(&line("east", "pool-a", 3.0, 60_000));
+        let key = LoadStore::key("east", "pool-a");
+        assert!(
+            store.fresh(&key, QUEUE, 10_000, 30_000).is_none(),
+            "a future timestamp must not read as fresh, or a dead site keeps winning"
         );
-        assert!(url.contains("?match[]="), "one parameter: {url}");
-        assert!(url.contains("%7B"), "the selector is encoded: {url}");
     }
 
     #[test]
-    fn an_endpoint_without_selectors_is_left_alone() {
-        let url = build_url("http://operator:9091/federate", &[]);
-        assert_eq!(url, "http://operator:9091/federate", "nothing appended");
+    fn metric_names_become_collect_parameters() {
+        let url = build_url("http://operator:9091/metrics", &[QUEUE.to_owned()]);
+        assert_eq!(
+            url,
+            format!("http://operator:9091/metrics?collect[]={QUEUE}"),
+            "one parameter carrying a bare metric name"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_metric_names_is_left_alone() {
+        let url = build_url("http://operator:9091/metrics", &[]);
+        assert_eq!(url, "http://operator:9091/metrics", "nothing appended");
     }
 }
