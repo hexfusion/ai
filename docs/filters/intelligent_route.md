@@ -63,6 +63,10 @@ Supports two modes:
 | `load.window_secs` | integer | no | Retention per series in seconds. |
 | `load.max_age_ms` | integer | no | Age past which a sample is ignored for routing, in milliseconds. A liveness bound rather than a freshness score: it stops a dead operator from pinning routing to values that stopped describing anything, and it does not otherwise rank one candidate above another. |
 | `load.timeout_ms` | integer | no | Request timeout in milliseconds. |
+| `load.tls` | LoadTls | no | TLS material for the endpoint, when it speaks TLS. The operator's signals listener runs mutual TLS wherever the grid declares trust material, and it names a caller by the certificate key presented. Without this the collector is a plain client: it would not trust the grid CA, and it could not be told apart from any other caller. |
+| `load.tls.ca_path` | string | yes | CA bundle the endpoint's certificate is verified against. |
+| `load.tls.cert_path` | string | no | Certificate presented to the endpoint. This is what names the caller. Omitting it leaves the collector unidentified, which a listener enforcing access will refuse. |
+| `load.tls.key_path` | string | no | Private key for `cert_path`. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |

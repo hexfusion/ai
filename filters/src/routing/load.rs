@@ -40,6 +40,28 @@ const DEFAULT_TIMEOUT_MS: u64 = 1_500;
 /// without bound.
 const MAX_SERIES: usize = 4_096;
 
+/// Paths to the material the collector presents and verifies against.
+///
+/// Paths rather than inline PEM, because the gateway already mounts the site
+/// Secret and a file is what a rotation rewrites in place.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LoadTls {
+    /// CA bundle the endpoint's certificate is verified against.
+    pub ca_path: String,
+
+    /// Certificate presented to the endpoint.
+    ///
+    /// This is what names the caller. Omitting it leaves the collector
+    /// unidentified, which a listener enforcing access will refuse.
+    #[serde(default)]
+    pub cert_path: Option<String>,
+
+    /// Private key for `cert_path`.
+    #[serde(default)]
+    pub key_path: Option<String>,
+}
+
 /// Collector configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +108,15 @@ pub(crate) struct LoadConfig {
     /// Request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+
+    /// TLS material for the endpoint, when it speaks TLS.
+    ///
+    /// The operator's signals listener runs mutual TLS wherever the grid
+    /// declares trust material, and it names a caller by the certificate key
+    /// presented. Without this the collector is a plain client: it would not
+    /// trust the grid CA, and it could not be told apart from any other caller.
+    #[serde(default)]
+    pub tls: Option<LoadTls>,
 }
 
 /// Default poll interval.
@@ -306,10 +337,8 @@ impl Drop for LoadCollector {
 /// indefinitely.
 pub(crate) fn spawn(config: &LoadConfig) -> Result<(Arc<LoadStore>, LoadCollector), FilterError> {
     let store = Arc::new(LoadStore::new(Duration::from_secs(config.window_secs)));
-    let url = build_url(&config.endpoint, &config.collect);
-    let interval = Duration::from_millis(config.interval_ms);
-    let timeout = Duration::from_millis(config.timeout_ms);
     let cancel = CancellationToken::new();
+    let polling_cfg = Polling::build(config)?;
 
     let polling = Arc::clone(&store);
     let stopping = cancel.clone();
@@ -323,22 +352,112 @@ pub(crate) fn spawn(config: &LoadConfig) -> Result<(Arc<LoadStore>, LoadCollecto
                     return;
                 },
             };
-            runtime.block_on(poll_loop(polling, stopping, url, interval, timeout));
+            runtime.block_on(poll_loop(polling, stopping, polling_cfg));
         })
         .map_err(|e| -> FilterError { format!("intelligent_route: load collector thread: {e}").into() })?;
 
     Ok((store, LoadCollector { cancel }))
 }
 
-/// Poll until cancelled, feeding every response into `store`.
-async fn poll_loop(
-    store: Arc<LoadStore>,
-    cancel: CancellationToken,
+/// Material the collector reads from disk once, at start.
+///
+/// Held as bytes rather than paths so a rotation cannot swap the file midway
+/// through building a client and leave a certificate that does not match its
+/// key. Picking up a rotation means building again, which is what a restart or
+/// a reload does.
+#[derive(Clone)]
+pub(crate) struct ClientTls {
+    /// CA bundle in PEM.
+    ca: Vec<u8>,
+    /// Certificate and key in one PEM, when the caller identifies itself.
+    identity: Option<Vec<u8>>,
+}
+
+impl ClientTls {
+    /// Read the configured material.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying IO error when a configured path cannot be read.
+    /// A missing file is worth failing on rather than falling back to an
+    /// anonymous client that a listener will refuse anyway.
+    pub(crate) fn load(cfg: &LoadTls) -> std::io::Result<Self> {
+        let identity = match (&cfg.cert_path, &cfg.key_path) {
+            (Some(cert), Some(key)) => {
+                let mut pem = std::fs::read(cert)?;
+                pem.extend_from_slice(&std::fs::read(key)?);
+                Some(pem)
+            },
+            _ => None,
+        };
+        Ok(Self {
+            ca: std::fs::read(&cfg.ca_path)?,
+            identity,
+        })
+    }
+}
+
+/// Build the polling client, with TLS when the endpoint needs it.
+fn build_client(timeout: Duration, tls: Option<&ClientTls>) -> reqwest::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(tls) = tls {
+        for cert in reqwest::Certificate::from_pem_bundle(&tls.ca)? {
+            builder = builder.add_root_certificate(cert);
+        }
+        if let Some(identity) = &tls.identity {
+            builder = builder.identity(reqwest::Identity::from_pem(identity)?);
+        }
+    }
+    builder.build()
+}
+
+/// Where and how the collector polls.
+struct Polling {
+    /// Fully built request URL, `collect[]` included.
     url: String,
+    /// Gap between polls.
     interval: Duration,
+    /// Per-request timeout.
     timeout: Duration,
-) {
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
+    /// Material presented and verified against, when the endpoint speaks TLS.
+    tls: Option<ClientTls>,
+}
+
+impl Polling {
+    /// Resolve the configuration, reading any TLS material from disk.
+    ///
+    /// Material is read here rather than in the collector thread so a missing
+    /// or unreadable file is a configuration error the caller sees, rather than
+    /// a collector that starts and is quietly refused on every poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FilterError`] when a configured path cannot be read.
+    fn build(config: &LoadConfig) -> Result<Self, FilterError> {
+        let tls = config
+            .tls
+            .as_ref()
+            .map(ClientTls::load)
+            .transpose()
+            .map_err(|e| -> FilterError { format!("intelligent_route: load collector TLS: {e}").into() })?;
+        Ok(Self {
+            url: build_url(&config.endpoint, &config.collect),
+            interval: Duration::from_millis(config.interval_ms),
+            timeout: Duration::from_millis(config.timeout_ms),
+            tls,
+        })
+    }
+}
+
+/// Poll until cancelled, feeding every response into `store`.
+async fn poll_loop(store: Arc<LoadStore>, cancel: CancellationToken, polling: Polling) {
+    let Polling {
+        url,
+        interval,
+        timeout,
+        tls,
+    } = polling;
+    let client = match build_client(timeout, tls.as_ref()) {
         Ok(c) => c,
         Err(error) => {
             tracing::error!(%error, "load collector client unavailable; routing falls back to overlay order");
@@ -406,6 +525,59 @@ fn encode(value: &str) -> String {
     reason = "tests"
 )]
 mod tests {
+
+    /// Write PEM-ish bytes to a temp file and return its path.
+    fn temp_pem(name: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("load-tls-{name}-{}", std::process::id()));
+        std::fs::write(&path, body).unwrap_or_else(|_| std::process::abort());
+        path
+    }
+
+    #[test]
+    fn tls_is_optional_and_absent_by_default() {
+        let cfg: LoadConfig = serde_yaml::from_str("endpoint: http://operator:9091/metrics\nqueue_metric: q\n")
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(cfg.tls.is_none(), "a plaintext endpoint needs no material");
+    }
+
+    #[test]
+    fn tls_paths_are_accepted() {
+        let cfg: LoadConfig = serde_yaml::from_str(
+            "endpoint: https://operator:9091/metrics\nqueue_metric: q\ntls:\n  ca_path: /etc/praxis/tls/ca.crt\n  cert_path: /etc/praxis/tls/tls.crt\n  key_path: /etc/praxis/tls/tls.key\n",
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let tls = cfg.tls.unwrap_or_else(|| std::process::abort());
+        assert_eq!(tls.ca_path, "/etc/praxis/tls/ca.crt");
+        assert_eq!(tls.cert_path.as_deref(), Some("/etc/praxis/tls/tls.crt"));
+    }
+
+    #[test]
+    fn a_certificate_without_a_key_names_nobody() {
+        // Half an identity is not an identity. Presenting nothing is honest;
+        // presenting a certificate we cannot prove is not.
+        let ca = temp_pem("ca", b"-----BEGIN CERTIFICATE-----\n");
+        let cfg = LoadTls {
+            ca_path: ca.to_string_lossy().into_owned(),
+            cert_path: Some("/nonexistent".to_owned()),
+            key_path: None,
+        };
+        let loaded = ClientTls::load(&cfg).unwrap_or_else(|_| std::process::abort());
+        assert!(loaded.identity.is_none(), "an unpaired certificate is not presented");
+        drop(std::fs::remove_file(ca));
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_not_an_anonymous_client() {
+        let cfg = LoadTls {
+            ca_path: "/nonexistent/ca.crt".to_owned(),
+            cert_path: None,
+            key_path: None,
+        };
+        assert!(
+            ClientTls::load(&cfg).is_err(),
+            "starting anonymous against a listener that will refuse us is worse than failing here"
+        );
+    }
     use super::*;
 
     const QUEUE: &str = "inference_pool_average_queue_size";
