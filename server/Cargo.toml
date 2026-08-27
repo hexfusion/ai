@@ -32,6 +32,9 @@ experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
 praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
+# The `policy` filter, and with it the authenticated identity that
+# `rate_limit` buckets on. Off by default in praxis; opt in here.
+policy-engine = ["praxis-filter/policy-engine"]
 
 [lints]
 workspace = true

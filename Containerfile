@@ -58,7 +58,7 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy
+    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -82,7 +82,7 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy \
+    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------
