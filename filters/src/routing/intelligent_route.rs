@@ -31,6 +31,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
+use metrics::counter;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 
@@ -512,9 +513,25 @@ impl IntelligentRouteFilter {
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
-        let Some(c) = select_admitted(&snap.candidates, kind, name, self.load.as_ref()) else {
-            tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
-            return Ok(FilterAction::Reject(Rejection::status(404)));
+        let Some(c) = select_admitted(
+            &snap.candidates,
+            kind,
+            name,
+            self.load.as_ref().map(|l| l.scorers.as_slice()),
+        ) else {
+            // 404 says the route does not exist, which is what a caller acts on
+            // when they got the model name wrong. A grid that is briefly unable
+            // to serve is a different fact, and answering both the same way
+            // makes saturation look like a configuration error.
+            let known = snap.candidates.iter().any(|c| c.kind == kind && &*c.name == name);
+            let status = if known { 503 } else { 404 };
+            tracing::debug!(
+                kind = kind.as_str(),
+                name = %name,
+                status,
+                "intelligent_route: no candidate"
+            );
+            return Ok(FilterAction::Reject(Rejection::status(status)));
         };
         apply_route(
             ctx,
@@ -962,18 +979,92 @@ fn select_admitted<'a>(
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
-    load: Option<&LoadRouting>,
+    scorers: Option<&[Box<dyn scoring::Scorer>]>,
 ) -> Option<&'a RouteCandidate> {
-    let admitted: Vec<&RouteCandidate> = candidates
-        .iter()
-        .filter(|c| c.kind == kind && &*c.name == name && is_admitted_for_new_request(c.admission_state))
-        .collect();
+    let (admitted, degraded) = admissible(candidates, kind, name);
     let first = admitted.first().copied();
-    let Some(load) = load else {
+    let Some(scorers) = scorers else {
+        record_route_decision_basis(
+            first,
+            if degraded {
+                BASIS_SATURATED
+            } else {
+                BASIS_NO_LOAD_SOURCE
+            },
+        );
         return first;
     };
-    let scores = scoring::score_all(&load.scorers, &admitted, load::now_ms());
-    scoring::pick(&admitted, &scores).or(first)
+    let scores = scoring::score_all(scorers, &admitted, load::now_ms());
+    if let Some(chosen) = scoring::pick(&admitted, &scores) {
+        record_route_decision_basis(Some(chosen), if degraded { BASIS_SATURATED } else { BASIS_LIVE_LOAD });
+        return Some(chosen);
+    }
+    record_route_decision_basis(
+        first,
+        if degraded {
+            BASIS_SATURATED
+        } else {
+            BASIS_NO_FRESH_SIGNAL
+        },
+    );
+    first
+}
+
+/// Candidates that may take this request, and whether that took a downgrade.
+///
+/// Nothing wanting new work is not the same as nothing being there. Rather
+/// than refuse, the least loaded of what remains is used, and the caller
+/// records that separately: routing new work to a site that asked not to
+/// receive it is a decision somebody should be able to see.
+fn admissible<'a>(
+    candidates: &'a [RouteCandidate],
+    kind: CapabilityKind,
+    name: &str,
+) -> (Vec<&'a RouteCandidate>, bool) {
+    let serving: Vec<&RouteCandidate> = candidates
+        .iter()
+        .filter(|c| c.kind == kind && &*c.name == name && c.admission_state != AdmissionState::Excluded)
+        .collect();
+    let admitted: Vec<&RouteCandidate> = serving
+        .iter()
+        .copied()
+        .filter(|c| is_admitted_for_new_request(c.admission_state))
+        .collect();
+    if admitted.is_empty() && !serving.is_empty() {
+        return (serving, true);
+    }
+    (admitted, false)
+}
+
+/// Routing decisions, by where they went and what decided.
+const METRIC_ROUTE_DECISIONS: &str = "praxis_ai_route_decisions_total";
+
+/// A live signal ranked the admitted candidates.
+const BASIS_LIVE_LOAD: &str = "live_load";
+
+/// No load source is configured, so the rendered order stands.
+const BASIS_NO_LOAD_SOURCE: &str = "no_load_source";
+
+/// Every candidate asked not to take new work, and one was chosen anyway.
+///
+/// The alternative is refusing the request, and a pool over its capacity is
+/// not the same as a pool that is gone. Worth counting on its own, because a
+/// grid that is permanently here is one nobody is watching.
+const BASIS_SATURATED: &str = "saturated";
+
+/// A load source is configured and no candidate had a usable sample.
+///
+/// Worth its own value rather than folding into the case above. A collector
+/// that is configured and silent looks identical in every log line to one that
+/// is working, and the decisions it is not making are the only visible trace.
+const BASIS_NO_FRESH_SIGNAL: &str = "no_fresh_signal";
+
+/// Count one routing decision.
+///
+/// Both labels are bounded: a site per grid member, and one of three reasons.
+fn record_route_decision_basis(chosen: Option<&RouteCandidate>, basis: &'static str) {
+    let site = chosen.map_or_else(|| "none".to_owned(), |c| c.site.to_string());
+    counter!(METRIC_ROUTE_DECISIONS, "basis" => basis, "site" => site).increment(1);
 }
 
 /// Whether a candidate passes admission filtering.
@@ -1991,7 +2082,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_new_and_existing_returns_404() {
+    async fn only_existing_only_is_routed_rather_than_refused() {
+        // A pool over its capacity is not a pool that is gone. Refusing here
+        // is what let saturation wedge: the requests that would show recovery
+        // are the ones being turned away.
         let snap = make_overlay_snapshot(&[("existing_only", "c-a"), ("none", "c-b")]);
         let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
@@ -2001,8 +2095,38 @@ mod tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(
+            !matches!(action, FilterAction::Reject(_)),
+            "a new session must still be routed when every candidate is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_servable_is_503_not_404() {
+        // 404 says the route does not exist, which is what a caller acts on
+        // when the model name is wrong. Saturation is a different fact.
+        let snap = make_overlay_snapshot(&[("none", "c-a"), ("none", "c-b")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "candidates that exist but cannot serve is unavailable, not unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_is_still_404() {
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a")]);
+        let filter = make_affinity_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(make_test_affinity()));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("no-such-model"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(
             matches!(action, FilterAction::Reject(r) if r.status == 404),
-            "new session with only existing_only/excluded must get 404"
+            "a model nothing serves is genuinely not found"
         );
     }
 
@@ -2819,5 +2943,65 @@ mod tests {
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
+    }
+}
+
+#[cfg(test)]
+mod route_decision_metric_tests {
+    use super::*;
+
+    fn candidate(site: &str, cluster: &str) -> RouteCandidate {
+        RouteCandidate {
+            admission_state: AdmissionState::NewAndExisting,
+            cluster: Arc::from(cluster),
+            credential: None,
+            fresh: true,
+            kind: CapabilityKind::InferenceModel,
+            name: Arc::from("llama"),
+            rank: None,
+            selection_tier: None,
+            site: Arc::from(site),
+            stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", site, cluster),
+        }
+    }
+
+    /// The basis label recorded for one selection.
+    fn basis_for(scorers: Option<&[Box<dyn scoring::Scorer>]>) -> String {
+        let candidates = vec![candidate("site-a", "inf-a"), candidate("site-b", "inf-b")];
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let _unused = select_admitted(&candidates, CapabilityKind::InferenceModel, "llama", scorers);
+        });
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .find(|(key, ..)| key.key().name() == METRIC_ROUTE_DECISIONS)
+            .and_then(|(key, ..)| {
+                key.key()
+                    .labels()
+                    .find(|l| l.key() == "basis")
+                    .map(|l| l.value().to_owned())
+            })
+            .unwrap_or_else(|| "no metric recorded".to_owned())
+    }
+
+    #[test]
+    fn no_load_source_is_named_as_such() {
+        assert_eq!(basis_for(None), BASIS_NO_LOAD_SOURCE);
+    }
+
+    #[test]
+    fn a_configured_collector_holding_nothing_is_not_reported_as_absent() {
+        // The failure this label exists for: a load source is configured and
+        // every decision is still the rendered order, which no log line says.
+        let store = Arc::new(load::LoadStore::new(Duration::from_secs(30)));
+        let scorers: Vec<Box<dyn scoring::Scorer>> = vec![Box::new(scoring::QueueScorer {
+            store: Arc::clone(&store),
+            metric: "q".into(),
+            max_age_ms: 15_000,
+        })];
+        assert_eq!(basis_for(Some(scorers.as_slice())), BASIS_NO_FRESH_SIGNAL);
     }
 }
