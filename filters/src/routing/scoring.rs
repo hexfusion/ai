@@ -24,9 +24,6 @@ use super::{descriptor::RouteCandidate, load::LoadStore};
 /// Returns `None` for a candidate the signal says nothing about, which is not
 /// the same as rating it badly.
 pub(crate) trait Scorer: Send + Sync {
-    /// Name, for diagnostics.
-    fn name(&self) -> &'static str;
-
     /// Raw values per candidate, in the order given.
     ///
     /// Normalisation is applied by [`score_all`], so an implementation reports
@@ -36,49 +33,27 @@ pub(crate) trait Scorer: Send + Sync {
     /// Whether a lower measurement is better.
     fn lower_is_better(&self) -> bool;
 
+    /// Whether the measurement is already a 0.0 to 1.0 rating.
+    ///
+    /// Min-max scaling makes a signal relative to the candidates in hand,
+    /// which is right for an unbounded quantity like queue depth and wrong for
+    /// a ratio: two pools at 0.10 and 0.12 utilisation would score 1.0 and 0.0
+    /// and the gateway would treat a trivial difference as a decisive one.
+    fn already_normalised(&self) -> bool {
+        false
+    }
+
     /// Relative weight in the combined score.
     fn weight(&self) -> f64 {
         1.0
     }
 }
 
-/// Queue depth, read from the live load store.
-pub(crate) struct QueueScorer {
-    /// Windowed signals keyed by `"site/cluster"`.
-    pub store: Arc<LoadStore>,
-    /// Metric that carries queue depth.
-    pub metric: Box<str>,
-    /// Age past which a sample is ignored.
-    pub max_age_ms: i64,
-}
-
-impl Scorer for QueueScorer {
-    fn name(&self) -> &'static str {
-        "queue_depth"
-    }
-
-    fn measure(&self, candidates: &[&RouteCandidate], now_ms: i64) -> Vec<Option<f64>> {
-        candidates
-            .iter()
-            .map(|c| {
-                let key = LoadStore::key(&c.site, &c.cluster);
-                self.store
-                    .fresh(&key, &self.metric, now_ms, self.max_age_ms)
-                    .map(|s| s.value)
-            })
-            .collect()
-    }
-
-    fn lower_is_better(&self) -> bool {
-        true
-    }
-}
-
-/// Normalise raw measurements onto `0.0..=1.0`, higher being better.
+/// Rate a measurement against the other candidates, so the best reading in
+/// hand becomes 1.0 and the worst 0.0.
 ///
-/// Scaled across the candidate set rather than against a fixed maximum, because
-/// what counts as a deep queue depends on the pool. A set whose values are all
-/// equal carries no preference and scores flat.
+/// This is what the endpoint picker's queue scorer does:
+/// `(max - v) / (max - min)`, and 1.0 for everyone when they are all equal.
 fn normalise(raw: &[Option<f64>], lower_is_better: bool) -> Vec<Option<f64>> {
     let present: Vec<f64> = raw.iter().flatten().copied().collect();
     let (Some(min), Some(max)) = (
@@ -101,16 +76,77 @@ fn normalise(raw: &[Option<f64>], lower_is_better: bool) -> Vec<Option<f64>> {
         .collect()
 }
 
+/// Take a measurement that is already a rating, inverting it when lower is
+/// better and clamping what a misreporting provider might send.
+fn rate_directly(raw: &[Option<f64>], lower_is_better: bool) -> Vec<Option<f64>> {
+    raw.iter()
+        .map(|value| {
+            value.map(|v| {
+                let clamped = v.clamp(0.0, 1.0);
+                if lower_is_better { 1.0 - clamped } else { clamped }
+            })
+        })
+        .collect()
+}
+
+/// One metric, read from the live load store.
+///
+/// The signal it rates is named by configuration, so a grid that publishes a
+/// signal this code has never heard of scores on it without a change here.
+pub(crate) struct MetricScorer {
+    /// Windowed signals keyed by `"site/cluster"`.
+    pub store: Arc<LoadStore>,
+    /// Metric that carries this signal.
+    pub metric: Box<str>,
+    /// Age past which a sample is ignored.
+    pub max_age_ms: i64,
+    /// Relative weight in the combined score.
+    pub weight: f64,
+    /// Whether a lower reading is the better one.
+    pub lower_is_better: bool,
+    /// Whether the reading is already a 0.0 to 1.0 rating.
+    pub already_normalised: bool,
+}
+
+impl Scorer for MetricScorer {
+    fn measure(&self, candidates: &[&RouteCandidate], now_ms: i64) -> Vec<Option<f64>> {
+        candidates
+            .iter()
+            .map(|c| {
+                let key = LoadStore::key(&c.site, &c.cluster);
+                self.store
+                    .fresh(&key, &self.metric, now_ms, self.max_age_ms)
+                    .map(|s| s.value)
+            })
+            .collect()
+    }
+
+    fn lower_is_better(&self) -> bool {
+        self.lower_is_better
+    }
+
+    fn already_normalised(&self) -> bool {
+        self.already_normalised
+    }
+
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+}
+
 /// Combined score per candidate, or `None` where no scorer had anything to say.
 pub(crate) fn score_all(scorers: &[Box<dyn Scorer>], candidates: &[&RouteCandidate], now_ms: i64) -> Vec<Option<f64>> {
     let mut totals = vec![0.0; candidates.len()];
     let mut weights = vec![0.0; candidates.len()];
     for scorer in scorers {
         let weight = scorer.weight();
-        for (index, score) in normalise(&scorer.measure(candidates, now_ms), scorer.lower_is_better())
-            .into_iter()
-            .enumerate()
-        {
+        let measured = scorer.measure(candidates, now_ms);
+        let rated = if scorer.already_normalised() {
+            rate_directly(&measured, scorer.lower_is_better())
+        } else {
+            normalise(&measured, scorer.lower_is_better())
+        };
+        for (index, score) in rated.into_iter().enumerate() {
             if let (Some(score), Some(total), Some(sum)) = (score, totals.get_mut(index), weights.get_mut(index)) {
                 *total += score * weight;
                 *sum += weight;
@@ -186,10 +222,6 @@ mod tests {
     }
 
     impl Scorer for Fixed {
-        fn name(&self) -> &'static str {
-            "fixed"
-        }
-
         fn measure(&self, _candidates: &[&RouteCandidate], _now_ms: i64) -> Vec<Option<f64>> {
             self.values.clone()
         }
@@ -298,5 +330,58 @@ mod tests {
             pick(&set, &[Some(1.0), Some(2.0)]).is_none(),
             "mismatched lengths cannot be trusted"
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_parity_tests {
+    use super::{normalise, rate_directly};
+
+    // The endpoint picker's multicluster queue scorer computes
+    // (maxQ - q) / (maxQ - minQ), and 1.0 when every candidate is equal.
+    // Ours has to agree, or a grid routes differently from a pool.
+    #[test]
+    fn queue_depth_matches_the_endpoint_pickers_min_max_rating() {
+        let measured = [Some(2.0), Some(6.0), Some(10.0)];
+        let rated = normalise(&measured, true);
+        let (min_q, max_q) = (2.0_f64, 10.0_f64);
+        for (i, raw) in measured.iter().enumerate() {
+            let expected = raw.map(|q| (max_q - q) / (max_q - min_q));
+            assert_eq!(rated.get(i).copied().flatten(), expected, "candidate {i}");
+        }
+    }
+
+    #[test]
+    fn an_equal_queue_across_candidates_rates_every_one_at_the_top() {
+        let rated = normalise(&[Some(4.0), Some(4.0)], true);
+        assert_eq!(rated, vec![Some(1.0), Some(1.0)]);
+    }
+
+    // Their KV scorer rates 1 - utilisation, absolute. Min-max scaling would
+    // turn a trivial spread into a decisive one.
+    #[test]
+    fn kv_cache_rates_one_minus_utilisation_rather_than_a_spread() {
+        let rated = rate_directly(&[Some(0.10), Some(0.12)], true);
+        assert_eq!(rated, vec![Some(0.90), Some(0.88)]);
+
+        let stretched = normalise(&[Some(0.10), Some(0.12)], true);
+        assert_eq!(
+            stretched,
+            vec![Some(1.0), Some(0.0)],
+            "min-max would have made two similar pools look opposite"
+        );
+    }
+
+    #[test]
+    fn a_utilisation_outside_the_ratio_is_clamped_not_trusted() {
+        assert_eq!(
+            rate_directly(&[Some(1.4), Some(-0.2)], true),
+            vec![Some(0.0), Some(1.0)]
+        );
+    }
+
+    #[test]
+    fn a_candidate_the_signal_says_nothing_about_stays_unrated() {
+        assert_eq!(rate_directly(&[None, Some(0.25)], true), vec![None, Some(0.75)]);
     }
 }

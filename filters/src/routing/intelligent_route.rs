@@ -99,10 +99,22 @@ struct IntelligentRouteConfig {
     /// Static list of route candidates (mutually exclusive with `overlay_file`).
     candidates: Option<Vec<CandidateConfig>>,
 
-    /// Live load signals polled from the local grid operator.
+    /// Where live load signals are polled from, how often, and when a sample
+    /// is too old to use.
     ///
     /// Absent by default, in which case selection is the overlay order alone.
     load: Option<load::LoadConfig>,
+
+    /// What to score candidates on, in order, each with its weight.
+    ///
+    /// Separate from `load` because that is the collector: where the numbers
+    /// come from is an operational question, and which of them decide a route
+    /// is a routing one.
+    ///
+    /// Omitted, this is queue depth and KV cache utilisation at equal weight,
+    /// which is what the endpoint picker scores a pool on.
+    #[serde(default = "load::default_signals")]
+    signals: Vec<load::SignalConfig>,
 
     /// Name of the local site (required in static mode, provided by overlay
     /// in overlay mode).
@@ -451,6 +463,9 @@ impl IntelligentRouteFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
+        // Before anything moves out of `cfg`, since this reads two of its
+        // fields together.
+        let load = load_routing_from(&cfg)?;
 
         if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
             return Err("intelligent_route: cannot set both overlay_file and candidates".into());
@@ -473,7 +488,6 @@ impl IntelligentRouteFilter {
 
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
-        let load = cfg.load.map(build_load_routing).transpose()?;
 
         Ok(Box::new(Self {
             model_header,
@@ -548,21 +562,39 @@ impl IntelligentRouteFilter {
 }
 
 /// Start the load collector described by `config`.
-fn build_load_routing(config: load::LoadConfig) -> Result<LoadRouting, FilterError> {
-    if config.queue_metric.trim().is_empty() {
-        return Err("intelligent_route: load.queue_metric must not be blank".into());
+fn load_routing_from(cfg: &IntelligentRouteConfig) -> Result<Option<LoadRouting>, FilterError> {
+    cfg.load
+        .as_ref()
+        .map(|source| build_load_routing(source, &cfg.signals))
+        .transpose()
+}
+
+/// Build the live-load scorers a configured collector feeds.
+fn build_load_routing(config: &load::LoadConfig, signals: &[load::SignalConfig]) -> Result<LoadRouting, FilterError> {
+    if signals.is_empty() {
+        return Err("intelligent_route: load.signals must name at least one metric".into());
     }
-    if config.interval_ms == 0 {
-        return Err("intelligent_route: load.interval_ms must be greater than zero".into());
+    if let Some(blank) = signals.iter().find(|s| s.metric.trim().is_empty()) {
+        let _ = blank;
+        return Err("intelligent_route: every load signal needs a metric name".into());
     }
-    let (store, collector) = load::spawn(&config)?;
-    let scorers: Vec<Box<dyn scoring::Scorer>> = vec![Box::new(scoring::QueueScorer {
-        store,
-        metric: config.queue_metric.into_boxed_str(),
-        max_age_ms: config.max_age_ms,
-    })];
+    let collect: Vec<String> = signals.iter().map(|s| s.metric.clone()).collect();
+    let (store, collector) = load::spawn(config, &collect)?;
+    let scorers: Vec<Box<dyn scoring::Scorer>> = signals
+        .iter()
+        .map(|signal| -> Box<dyn scoring::Scorer> {
+            Box::new(scoring::MetricScorer {
+                store: Arc::clone(&store),
+                metric: signal.metric.clone().into_boxed_str(),
+                max_age_ms: config.max_age_ms,
+                weight: signal.weight,
+                lower_is_better: signal.lower_is_better,
+                already_normalised: signal.scale == load::SignalScale::Ratio,
+            })
+        })
+        .collect();
     tracing::info!(
-        scorers = scorers.iter().map(|s| s.name()).collect::<Vec<_>>().join(","),
+        signals = signals.iter().map(|s| s.metric.as_str()).collect::<Vec<_>>().join(","),
         "intelligent_route: live load scoring enabled"
     );
     Ok(LoadRouting {
@@ -2997,10 +3029,13 @@ mod route_decision_metric_tests {
         // The failure this label exists for: a load source is configured and
         // every decision is still the rendered order, which no log line says.
         let store = Arc::new(load::LoadStore::new(Duration::from_secs(30)));
-        let scorers: Vec<Box<dyn scoring::Scorer>> = vec![Box::new(scoring::QueueScorer {
+        let scorers: Vec<Box<dyn scoring::Scorer>> = vec![Box::new(scoring::MetricScorer {
             store: Arc::clone(&store),
             metric: "q".into(),
             max_age_ms: 15_000,
+            weight: 1.0,
+            lower_is_better: true,
+            already_normalised: false,
         })];
         assert_eq!(basis_for(Some(scorers.as_slice())), BASIS_NO_FRESH_SIGNAL);
     }

@@ -75,21 +75,7 @@ pub(crate) struct LoadConfig {
     /// every remote candidate unscored.
     pub endpoint: String,
 
-    /// Metric name that carries queue depth.
-    ///
-    /// Named here rather than assumed, because the operator republishes what a
-    /// provider exposes and providers do not agree on what to call it.
-    pub queue_metric: String,
-
-    /// Metric names sent as `collect[]`, narrowing what the operator returns.
-    ///
-    /// These are bare names, not selectors. The operator filters by metric name
-    /// only, so a label matcher here would match nothing and silently drop the
-    /// series it was meant to narrow.
-    #[serde(default)]
-    pub collect: Vec<String>,
-
-    /// Poll interval in milliseconds.
+    /// How often the endpoint is polled, in milliseconds.
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
 
@@ -335,10 +321,10 @@ impl Drop for LoadCollector {
 /// A poll that fails is logged and retried on the next tick. The store keeps
 /// what it had, and `max_age_ms` is what stops that from being used
 /// indefinitely.
-pub(crate) fn spawn(config: &LoadConfig) -> Result<(Arc<LoadStore>, LoadCollector), FilterError> {
+pub(crate) fn spawn(config: &LoadConfig, collect: &[String]) -> Result<(Arc<LoadStore>, LoadCollector), FilterError> {
     let store = Arc::new(LoadStore::new(Duration::from_secs(config.window_secs)));
     let cancel = CancellationToken::new();
-    let polling_cfg = Polling::build(config)?;
+    let polling_cfg = Polling::build(config, collect)?;
 
     let polling = Arc::clone(&store);
     let stopping = cancel.clone();
@@ -433,7 +419,7 @@ impl Polling {
     /// # Errors
     ///
     /// Returns a [`FilterError`] when a configured path cannot be read.
-    fn build(config: &LoadConfig) -> Result<Self, FilterError> {
+    fn build(config: &LoadConfig, collect: &[String]) -> Result<Self, FilterError> {
         let tls = config
             .tls
             .as_ref()
@@ -441,7 +427,7 @@ impl Polling {
             .transpose()
             .map_err(|e| -> FilterError { format!("intelligent_route: load collector TLS: {e}").into() })?;
         Ok(Self {
-            url: build_url(&config.endpoint, &config.collect),
+            url: build_url(&config.endpoint, collect),
             interval: Duration::from_millis(config.interval_ms),
             timeout: Duration::from_millis(config.timeout_ms),
             tls,
@@ -535,15 +521,15 @@ mod tests {
 
     #[test]
     fn tls_is_optional_and_absent_by_default() {
-        let cfg: LoadConfig = serde_yaml::from_str("endpoint: http://operator:9091/metrics\nqueue_metric: q\n")
-            .unwrap_or_else(|_| std::process::abort());
+        let cfg: LoadConfig =
+            serde_yaml::from_str("endpoint: http://operator:9091/metrics\n").unwrap_or_else(|_| std::process::abort());
         assert!(cfg.tls.is_none(), "a plaintext endpoint needs no material");
     }
 
     #[test]
     fn tls_paths_are_accepted() {
         let cfg: LoadConfig = serde_yaml::from_str(
-            "endpoint: https://operator:9091/metrics\nqueue_metric: q\ntls:\n  ca_path: /etc/praxis/tls/ca.crt\n  cert_path: /etc/praxis/tls/tls.crt\n  key_path: /etc/praxis/tls/tls.key\n",
+            "endpoint: https://operator:9091/metrics\ntls:\n  ca_path: /etc/praxis/tls/ca.crt\n  cert_path: /etc/praxis/tls/tls.crt\n  key_path: /etc/praxis/tls/tls.key\n",
         )
         .unwrap_or_else(|_| std::process::abort());
         let tls = cfg.tls.unwrap_or_else(|| std::process::abort());
@@ -707,4 +693,71 @@ mod tests {
         let url = build_url("http://operator:9091/metrics", &[]);
         assert_eq!(url, "http://operator:9091/metrics", "nothing appended");
     }
+}
+
+/// The signals a grid scores on when it names none.
+///
+/// The two the endpoint picker's multicluster scorers read, under the names
+/// the operator republishes them as.
+pub(crate) fn default_signals() -> Vec<SignalConfig> {
+    vec![
+        SignalConfig {
+            metric: "llm_d_epp_average_queue_size".to_owned(),
+            weight: default_signal_weight(),
+            lower_is_better: true,
+            scale: SignalScale::Relative,
+        },
+        SignalConfig {
+            metric: "llm_d_epp_average_kv_cache_utilization".to_owned(),
+            weight: default_signal_weight(),
+            lower_is_better: true,
+            scale: SignalScale::Ratio,
+        },
+    ]
+}
+
+/// Default weight for a load signal.
+const fn default_signal_weight() -> f64 {
+    1.0
+}
+
+/// Default direction for a load signal.
+const fn default_lower_is_better() -> bool {
+    true
+}
+
+/// One signal the gateway scores candidates on.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SignalConfig {
+    /// Metric name, as the signals endpoint publishes it.
+    pub metric: String,
+
+    /// Relative weight in the combined score.
+    #[serde(default = "default_signal_weight")]
+    pub weight: f64,
+
+    /// Whether a lower reading is the better one. True for queue depth and
+    /// utilisation alike, which is why it is the default.
+    #[serde(default = "default_lower_is_better")]
+    pub lower_is_better: bool,
+
+    /// How the reading becomes a rating.
+    #[serde(default)]
+    pub scale: SignalScale,
+}
+
+/// How a raw reading is turned into a 0.0 to 1.0 rating.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SignalScale {
+    /// Rate against the other candidates, for an unbounded quantity such as
+    /// queue depth. This is what the endpoint picker's queue scorer does.
+    #[default]
+    Relative,
+
+    /// Take the reading as the rating, for something already a ratio such as
+    /// cache utilisation. Scaling one of those against the candidates in hand
+    /// turns a trivial spread into a decisive one.
+    Ratio,
 }
