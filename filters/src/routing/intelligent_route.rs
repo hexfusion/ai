@@ -99,17 +99,19 @@ struct IntelligentRouteConfig {
     /// Static list of route candidates (mutually exclusive with `overlay_file`).
     candidates: Option<Vec<CandidateConfig>>,
 
-    /// Where live load signals are polled from, how often, and when a sample
-    /// is too old to use.
+    /// Signals endpoint on the local operator.
     ///
-    /// Absent by default, in which case selection is the overlay order alone.
-    load: Option<load::LoadConfig>,
+    /// Defaults to the operator's own service in this namespace, which is
+    /// where it is unless a deployment renamed it. That this is polled on an
+    /// interval, held in a window and aged out is how the filter does its job,
+    /// not something a deployment describes.
+    #[serde(default = "load::default_signals_endpoint")]
+    signals_endpoint: String,
+
+    /// Client material presented to the signals endpoint, when it asks.
+    signals_tls: Option<load::LoadTls>,
 
     /// What to score candidates on, in order, each with its weight.
-    ///
-    /// Separate from `load` because that is the collector: where the numbers
-    /// come from is an operational question, and which of them decide a route
-    /// is a routing one.
     ///
     /// Omitted, this is queue depth and KV cache utilisation at equal weight,
     /// which is what the endpoint picker scores a pool on.
@@ -563,10 +565,8 @@ impl IntelligentRouteFilter {
 
 /// Start the load collector described by `config`.
 fn load_routing_from(cfg: &IntelligentRouteConfig) -> Result<Option<LoadRouting>, FilterError> {
-    cfg.load
-        .as_ref()
-        .map(|source| build_load_routing(source, &cfg.signals))
-        .transpose()
+    let source = load::LoadConfig::polling(cfg.signals_endpoint.clone(), cfg.signals_tls.clone());
+    build_load_routing(&source, &cfg.signals).map(Some)
 }
 
 /// Build the live-load scorers a configured collector feeds.

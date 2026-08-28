@@ -44,7 +44,7 @@ const MAX_SERIES: usize = 4_096;
 ///
 /// Paths rather than inline PEM, because the gateway already mounts the site
 /// Secret and a file is what a rotation rewrites in place.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoadTls {
     /// CA bundle the endpoint's certificate is verified against.
@@ -693,6 +693,30 @@ mod tests {
         let url = build_url("http://operator:9091/metrics", &[]);
         assert_eq!(url, "http://operator:9091/metrics", "nothing appended");
     }
+}
+
+impl LoadConfig {
+    /// A collector for one endpoint, on the intervals this filter uses.
+    ///
+    /// Polling cadence, retention and staleness are how the filter does its
+    /// job rather than something a deployment states, so they are not asked
+    /// for. A deployment names the endpoint and what to score on.
+    pub fn polling(endpoint: String, tls: Option<LoadTls>) -> Self {
+        Self {
+            endpoint,
+            interval_ms: default_interval_ms(),
+            window_secs: default_window_secs(),
+            max_age_ms: default_max_age_ms(),
+            timeout_ms: default_timeout_ms(),
+            tls,
+        }
+    }
+}
+
+/// The operator's signals endpoint, as it is addressed from inside the
+/// cluster it runs in.
+pub(crate) fn default_signals_endpoint() -> String {
+    "https://grid-operator-signals:9091/metrics".to_owned()
 }
 
 /// The signals a grid scores on when it names none.
