@@ -745,12 +745,14 @@ pub(crate) fn default_signals() -> Vec<SignalConfig> {
             weight: default_signal_weight(),
             lower_is_better: true,
             scale: SignalScale::Ratio,
-            // Off, because there is nothing yet to set it from. Every
-            // utilisation spread observed so far is at most 0.020, so any
-            // threshold argued from preemption behaviour would silence the
-            // signal outright rather than filter it. It stays live and
-            // contributes little until real serving gives a spread to measure.
-            deadband: 0.0,
+            // Replaying a recorded trace: with no deadband here, utilisation
+            // decides every tie the queue deadband creates, on spreads of at
+            // most 0.020. That moved 28 of 183 decisions off the local site
+            // for nothing. At 0.02 the decisions match a run with utilisation
+            // switched off entirely, so this filters the noise without
+            // silencing the signal. 0.05 leaves margin and is far below where
+            // real serving varies.
+            deadband: 0.05,
         },
     ]
 }

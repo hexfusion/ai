@@ -489,3 +489,128 @@ mod deadband_tests {
         assert!(!within_deadband(&[Some(0.5), Some(0.0)], 0.0));
     }
 }
+
+/// Replaying a recorded trace of signal scrapes through the real scoring path.
+///
+/// A tuning question is which weight or deadband produces which decisions, and
+/// a multi-cluster run answers it in twenty minutes. The scrapes are the only
+/// input scoring has, so a recorded trace answers the same question in
+/// milliseconds, and answers it against the parser and store the gateway uses
+/// rather than a model of them.
+#[cfg(test)]
+mod replay {
+    use std::sync::Arc;
+
+    use super::{MetricScorer, Scorer, pick, score_all, tests::candidate};
+    use crate::routing::load::LoadStore;
+
+    const QUEUE: &str = "llm_d_epp_average_queue_size";
+    const KV: &str = "llm_d_epp_average_kv_cache_utilization";
+
+    /// One recorded scrape: the body the endpoint returned, and when.
+    struct Scrape {
+        at_ms: i64,
+        body: String,
+    }
+
+    fn trace() -> Vec<Scrape> {
+        let raw = include_str!("../../tests/fixtures/signals-trace.jsonl");
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap_or_else(|_| std::process::abort());
+                Scrape {
+                    at_ms: v.get("at_ms").and_then(serde_json::Value::as_i64).unwrap_or_default(),
+                    body: v
+                        .get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    /// Scorers for one tuning.
+    fn tuned(store: &Arc<LoadStore>, queue_deadband: f64, kv_weight: f64, kv_deadband: f64) -> Vec<Box<dyn Scorer>> {
+        vec![
+            Box::new(MetricScorer {
+                store: Arc::clone(store),
+                metric: QUEUE.into(),
+                max_age_ms: 15_000,
+                weight: 1.0,
+                lower_is_better: true,
+                already_normalised: false,
+                deadband: queue_deadband,
+            }),
+            Box::new(MetricScorer {
+                store: Arc::clone(store),
+                metric: KV.into(),
+                max_age_ms: 15_000,
+                weight: kv_weight,
+                lower_is_better: true,
+                already_normalised: true,
+                deadband: kv_deadband,
+            }),
+        ]
+    }
+
+    /// Sites chosen across the whole trace under one tuning.
+    fn decisions(queue_deadband: f64, kv_weight: f64, kv_deadband: f64) -> (usize, usize, usize) {
+        let store = Arc::new(LoadStore::new(std::time::Duration::from_secs(60)));
+        let scorers = tuned(&store, queue_deadband, kv_weight, kv_deadband);
+        let local = candidate("pool-a", "llmd-pool-a-provider");
+        let remote = candidate("pool-b", "llmd-pool-b-provider");
+        let candidates = [&local, &remote];
+
+        let (mut a, mut b, mut none) = (0, 0, 0);
+        for scrape in trace() {
+            store.ingest(&scrape.body);
+            let scores = score_all(&scorers, &candidates, scrape.at_ms);
+            match pick(&candidates, &scores) {
+                Some(c) if c.site.as_ref() == "pool-a" => a += 1,
+                Some(_) => b += 1,
+                None => none += 1,
+            }
+        }
+        (a, b, none)
+    }
+
+    #[test]
+    fn the_trace_replays_through_the_real_parser_and_store() {
+        let (a, b, none) = decisions(1.0, 1.0, 0.05);
+        assert!(
+            a + b > 150,
+            "the trace should decide most of its scrapes: {a} local, {b} remote, {none} undecided"
+        );
+    }
+
+    #[test]
+    fn the_deadband_keeps_work_local_that_nothing_justified_moving() {
+        let (without, ..) = decisions(0.0, 1.0, 0.05);
+        let (with, ..) = decisions(1.0, 1.0, 0.05);
+        assert!(
+            with > without,
+            "a deadband should keep requests local, not move them: {without} local without, {with} with"
+        );
+    }
+
+    /// Not an assertion. Prints the decision split across a grid of tunings so
+    /// a weight can be chosen against a recorded run rather than argued.
+    ///
+    ///   `cargo test -p praxis-ai-filters --features praxis-main tuning_grid -- --nocapture --ignored`
+    #[test]
+    #[ignore = "prints a tuning table rather than asserting"]
+    #[expect(clippy::print_stdout, reason = "the table is the point of this one")]
+    fn tuning_grid() {
+        println!("\n  queue_db  kv_weight  kv_db   local  remote  undecided");
+        for deadband in [0.0, 1.0, 2.0] {
+            for kv_weight in [0.0, 1.0] {
+                for kv_deadband in [0.0, 0.02, 0.05] {
+                    let (a, b, none) = decisions(deadband, kv_weight, kv_deadband);
+                    println!("  {deadband:>8.1} {kv_weight:>10.1} {kv_deadband:>6.2} {a:>7} {b:>7} {none:>10}");
+                }
+            }
+        }
+    }
+}
