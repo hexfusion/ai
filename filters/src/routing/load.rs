@@ -730,12 +730,27 @@ pub(crate) fn default_signals() -> Vec<SignalConfig> {
             weight: default_signal_weight(),
             lower_is_better: true,
             scale: SignalScale::Relative,
+            // Measured, not reasoned. Across 183 ticks of five runs the
+            // spread between sites is bimodal: 30% of the time under 1.0 and
+            // 64% of the time over 2.0, with 6% in between. A threshold
+            // anywhere in that gap separates the two, so 1.0 is the
+            // conservative end rather than a fitted value.
+            //
+            // The quantity is averaged over the pods in a pool, so with two
+            // pods 1.0 is two queued requests, not one.
+            deadband: 1.0,
         },
         SignalConfig {
             key: "llm_d_epp_average_kv_cache_utilization".to_owned(),
             weight: default_signal_weight(),
             lower_is_better: true,
             scale: SignalScale::Ratio,
+            // Off, because there is nothing yet to set it from. Every
+            // utilisation spread observed so far is at most 0.020, so any
+            // threshold argued from preemption behaviour would silence the
+            // signal outright rather than filter it. It stays live and
+            // contributes little until real serving gives a spread to measure.
+            deadband: 0.0,
         },
     ]
 }
@@ -776,6 +791,24 @@ pub(crate) struct SignalConfig {
     /// How the reading becomes a rating.
     #[serde(default)]
     pub scale: SignalScale,
+
+    /// Spread below which candidates are treated as equal on this signal.
+    ///
+    /// In the signal's own units, not in rating units. Relative scaling turns
+    /// whatever spread exists into the full 0..1 range, so half a queued
+    /// request reads as decisively as two hundred. That sends every request
+    /// across a region to a pool that is emptier by nothing.
+    ///
+    /// Below the deadband the signal expresses no preference, and the decision
+    /// falls to the other signals, then to the order the overlay rendered,
+    /// which is by locality. A tie is resolved by being closer.
+    ///
+    /// The value has to clear two costs. Moving buys queue time and pays
+    /// network time, so it is worth it above `(L_remote - L_local) /
+    /// T_service` in queue units. And the reading describes the past, so it
+    /// has to exceed how far the difference drifts within one poll.
+    #[serde(default)]
+    pub deadband: f64,
 }
 
 /// How a raw reading is turned into a 0.0 to 1.0 rating.

@@ -569,6 +569,19 @@ fn load_routing_from(cfg: &IntelligentRouteConfig) -> Result<Option<LoadRouting>
     build_load_routing(&source, &cfg.signals).map(Some)
 }
 
+/// One scorer for one declared signal.
+fn scorer_for(signal: &load::SignalConfig, store: &Arc<load::LoadStore>, max_age_ms: i64) -> Box<dyn scoring::Scorer> {
+    Box::new(scoring::MetricScorer {
+        store: Arc::clone(store),
+        metric: signal.key.clone().into_boxed_str(),
+        max_age_ms,
+        weight: signal.weight,
+        lower_is_better: signal.lower_is_better,
+        already_normalised: signal.scale == load::SignalScale::Ratio,
+        deadband: signal.deadband,
+    })
+}
+
 /// Build the live-load scorers a configured collector feeds.
 fn build_load_routing(config: &load::LoadConfig, signals: &[load::SignalConfig]) -> Result<LoadRouting, FilterError> {
     if signals.is_empty() {
@@ -582,16 +595,7 @@ fn build_load_routing(config: &load::LoadConfig, signals: &[load::SignalConfig])
     let (store, collector) = load::spawn(config, &collect)?;
     let scorers: Vec<Box<dyn scoring::Scorer>> = signals
         .iter()
-        .map(|signal| -> Box<dyn scoring::Scorer> {
-            Box::new(scoring::MetricScorer {
-                store: Arc::clone(&store),
-                metric: signal.key.clone().into_boxed_str(),
-                max_age_ms: config.max_age_ms,
-                weight: signal.weight,
-                lower_is_better: signal.lower_is_better,
-                already_normalised: signal.scale == load::SignalScale::Ratio,
-            })
-        })
+        .map(|signal| scorer_for(signal, &store, config.max_age_ms))
         .collect();
     tracing::info!(
         signals = signals.iter().map(|s| s.key.as_str()).collect::<Vec<_>>().join(","),
@@ -3036,6 +3040,7 @@ mod route_decision_metric_tests {
             weight: 1.0,
             lower_is_better: true,
             already_normalised: false,
+            deadband: 0.0,
         })];
         assert_eq!(basis_for(Some(scorers.as_slice())), BASIS_NO_FRESH_SIGNAL);
     }

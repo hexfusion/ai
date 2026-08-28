@@ -33,6 +33,13 @@ pub(crate) trait Scorer: Send + Sync {
     /// Whether a lower measurement is better.
     fn lower_is_better(&self) -> bool;
 
+    /// Spread below which every candidate rates the same on this signal.
+    ///
+    /// In the signal's own units. Zero means every difference counts.
+    fn deadband(&self) -> f64 {
+        0.0
+    }
+
     /// Whether the measurement is already a 0.0 to 1.0 rating.
     ///
     /// Min-max scaling makes a signal relative to the candidates in hand,
@@ -47,6 +54,22 @@ pub(crate) trait Scorer: Send + Sync {
     fn weight(&self) -> f64 {
         1.0
     }
+}
+
+/// Whether the candidates differ by less than this signal can meaningfully
+/// distinguish.
+fn within_deadband(raw: &[Option<f64>], deadband: f64) -> bool {
+    if deadband <= 0.0 {
+        return false;
+    }
+    let present: Vec<f64> = raw.iter().flatten().copied().collect();
+    let (Some(min), Some(max)) = (
+        present.iter().copied().reduce(f64::min),
+        present.iter().copied().reduce(f64::max),
+    ) else {
+        return false;
+    };
+    max - min <= deadband
 }
 
 /// Rate a measurement against the other candidates, so the best reading in
@@ -106,6 +129,8 @@ pub(crate) struct MetricScorer {
     pub lower_is_better: bool,
     /// Whether the reading is already a 0.0 to 1.0 rating.
     pub already_normalised: bool,
+    /// Spread below which candidates rate the same, in the signal's units.
+    pub deadband: f64,
 }
 
 impl Scorer for MetricScorer {
@@ -129,6 +154,10 @@ impl Scorer for MetricScorer {
         self.already_normalised
     }
 
+    fn deadband(&self) -> f64 {
+        self.deadband
+    }
+
     fn weight(&self) -> f64 {
         self.weight
     }
@@ -141,7 +170,12 @@ pub(crate) fn score_all(scorers: &[Box<dyn Scorer>], candidates: &[&RouteCandida
     for scorer in scorers {
         let weight = scorer.weight();
         let measured = scorer.measure(candidates, now_ms);
-        let rated = if scorer.already_normalised() {
+        // A spread too small to mean anything expresses no preference at all,
+        // rather than a small one. Relative scaling has no small preference to
+        // give: it maps whatever spread exists onto the whole range.
+        let rated = if within_deadband(&measured, scorer.deadband()) {
+            measured.iter().map(|m| m.map(|_| 1.0)).collect()
+        } else if scorer.already_normalised() {
             rate_directly(&measured, scorer.lower_is_better())
         } else {
             normalise(&measured, scorer.lower_is_better())
@@ -199,7 +233,7 @@ mod tests {
         *,
     };
 
-    fn candidate(site: &str, cluster: &str) -> RouteCandidate {
+    pub(super) fn candidate(site: &str, cluster: &str) -> RouteCandidate {
         RouteCandidate {
             admission_state: AdmissionState::NewAndExisting,
             cluster: Arc::from(cluster),
@@ -383,5 +417,75 @@ mod upstream_parity_tests {
     #[test]
     fn a_candidate_the_signal_says_nothing_about_stays_unrated() {
         assert_eq!(rate_directly(&[None, Some(0.25)], true), vec![None, Some(0.75)]);
+    }
+}
+
+#[cfg(test)]
+mod deadband_tests {
+    use super::{Scorer, score_all, within_deadband};
+    use crate::routing::descriptor::RouteCandidate;
+
+    struct Fixed {
+        values: Vec<Option<f64>>,
+        deadband: f64,
+    }
+
+    impl Scorer for Fixed {
+        fn measure(&self, _: &[&RouteCandidate], _: i64) -> Vec<Option<f64>> {
+            self.values.clone()
+        }
+
+        fn lower_is_better(&self) -> bool {
+            true
+        }
+
+        fn deadband(&self) -> f64 {
+            self.deadband
+        }
+    }
+
+    // The case from a real run: one pool idle at half a queued request, the
+    // other at none. Without a deadband that is a total preference for the
+    // remote pool, which is a region away and emptier by nothing.
+    #[test]
+    fn half_a_queued_request_is_not_a_reason_to_leave_the_local_site() {
+        assert!(within_deadband(&[Some(0.5), Some(0.0)], 1.0));
+    }
+
+    #[test]
+    fn a_real_queue_difference_still_decides() {
+        assert!(!within_deadband(&[Some(16.5), Some(0.0)], 1.0));
+    }
+
+    fn scored(values: Vec<Option<f64>>, deadband: f64) -> Vec<Option<f64>> {
+        let local = super::tests::candidate("pool-a", "a");
+        let remote = super::tests::candidate("pool-b", "b");
+        let candidates = [&local, &remote];
+        let scorers: Vec<Box<dyn Scorer>> = vec![Box::new(Fixed { values, deadband })];
+        score_all(&scorers, &candidates, 0)
+    }
+
+    #[test]
+    fn inside_the_deadband_every_candidate_rates_the_same() {
+        assert_eq!(
+            scored(vec![Some(0.5), Some(0.0)], 1.0),
+            vec![Some(1.0), Some(1.0)],
+            "no preference, so the overlay order decides and that order is by locality"
+        );
+    }
+
+    #[test]
+    fn outside_it_the_emptier_candidate_wins_outright() {
+        assert_eq!(scored(vec![Some(16.5), Some(0.0)], 1.0), vec![Some(0.0), Some(1.0)]);
+    }
+
+    #[test]
+    fn a_signal_nobody_reports_is_not_a_narrow_spread() {
+        assert!(!within_deadband(&[None, None], 1.0));
+    }
+
+    #[test]
+    fn zero_means_every_difference_counts() {
+        assert!(!within_deadband(&[Some(0.5), Some(0.0)], 0.0));
     }
 }
