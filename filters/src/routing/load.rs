@@ -726,13 +726,13 @@ pub(crate) fn default_signals_endpoint() -> String {
 pub(crate) fn default_signals() -> Vec<SignalConfig> {
     vec![
         SignalConfig {
-            metric: "llm_d_epp_average_queue_size".to_owned(),
+            key: "llm_d_epp_average_queue_size".to_owned(),
             weight: default_signal_weight(),
             lower_is_better: true,
             scale: SignalScale::Relative,
         },
         SignalConfig {
-            metric: "llm_d_epp_average_kv_cache_utilization".to_owned(),
+            key: "llm_d_epp_average_kv_cache_utilization".to_owned(),
             weight: default_signal_weight(),
             lower_is_better: true,
             scale: SignalScale::Ratio,
@@ -754,8 +754,15 @@ const fn default_lower_is_better() -> bool {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SignalConfig {
-    /// Metric name, as the signals endpoint publishes it.
-    pub metric: String,
+    /// What this signal is called by the source that publishes it.
+    ///
+    /// A key rather than a name, because it is not this entry's own identity:
+    /// it addresses a value in the source's keyspace. Nothing here assumes
+    /// that value came from a scraped metric.
+    ///
+    /// A key the source does not publish is not an error. The signal says
+    /// nothing about any candidate, and the others decide the route.
+    pub key: String,
 
     /// Relative weight in the combined score.
     #[serde(default = "default_signal_weight")]

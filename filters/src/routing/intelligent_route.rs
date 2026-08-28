@@ -574,18 +574,18 @@ fn build_load_routing(config: &load::LoadConfig, signals: &[load::SignalConfig])
     if signals.is_empty() {
         return Err("intelligent_route: load.signals must name at least one metric".into());
     }
-    if let Some(blank) = signals.iter().find(|s| s.metric.trim().is_empty()) {
+    if let Some(blank) = signals.iter().find(|s| s.key.trim().is_empty()) {
         let _ = blank;
-        return Err("intelligent_route: every load signal needs a metric name".into());
+        return Err("intelligent_route: every signal needs a key".into());
     }
-    let collect: Vec<String> = signals.iter().map(|s| s.metric.clone()).collect();
+    let collect: Vec<String> = signals.iter().map(|s| s.key.clone()).collect();
     let (store, collector) = load::spawn(config, &collect)?;
     let scorers: Vec<Box<dyn scoring::Scorer>> = signals
         .iter()
         .map(|signal| -> Box<dyn scoring::Scorer> {
             Box::new(scoring::MetricScorer {
                 store: Arc::clone(&store),
-                metric: signal.metric.clone().into_boxed_str(),
+                metric: signal.key.clone().into_boxed_str(),
                 max_age_ms: config.max_age_ms,
                 weight: signal.weight,
                 lower_is_better: signal.lower_is_better,
@@ -594,7 +594,7 @@ fn build_load_routing(config: &load::LoadConfig, signals: &[load::SignalConfig])
         })
         .collect();
     tracing::info!(
-        signals = signals.iter().map(|s| s.metric.as_str()).collect::<Vec<_>>().join(","),
+        signals = signals.iter().map(|s| s.key.as_str()).collect::<Vec<_>>().join(","),
         "intelligent_route: live load scoring enabled"
     );
     Ok(LoadRouting {
