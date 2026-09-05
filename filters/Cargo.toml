@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_filters"
 
 [features]
-default = ["apis"]
+default = ["apis", "praxis-main"]
 apis = ["praxis-ai-apis/default"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.

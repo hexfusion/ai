@@ -55,18 +55,20 @@ Supports two modes:
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
-| `load` | LoadConfig | no | Live load signals polled from the local grid operator. Absent by default, in which case selection is the overlay order alone. |
-| `load.endpoint` | string | yes | Signals endpoint on the local operator, e.g. `http://grid-operator:9091/metrics`. Unqualified, this carries the local site and every peer the operator has collected. Adding `?target=<site>` narrows it to one site, which is what peer operators ask for, so pointing here at that instead would leave every remote candidate unscored. |
-| `load.queue_metric` | string | yes | Metric name that carries queue depth. Named here rather than assumed, because the operator republishes what a provider exposes and providers do not agree on what to call it. |
-| `load.collect` | string[] | no | Metric names sent as `collect[]`, narrowing what the operator returns. These are bare names, not selectors. The operator filters by metric name only, so a label matcher here would match nothing and silently drop the series it was meant to narrow. |
-| `load.interval_ms` | integer | no | Poll interval in milliseconds. |
-| `load.window_secs` | integer | no | Retention per series in seconds. |
-| `load.max_age_ms` | integer | no | Age past which a sample is ignored for routing, in milliseconds. A liveness bound rather than a freshness score: it stops a dead operator from pinning routing to values that stopped describing anything, and it does not otherwise rank one candidate above another. |
-| `load.timeout_ms` | integer | no | Request timeout in milliseconds. |
-| `load.tls` | LoadTls | no | TLS material for the endpoint, when it speaks TLS. The operator's signals listener runs mutual TLS wherever the grid declares trust material, and it names a caller by the certificate key presented. Without this the collector is a plain client: it would not trust the grid CA, and it could not be told apart from any other caller. |
-| `load.tls.ca_path` | string | yes | CA bundle the endpoint's certificate is verified against. |
-| `load.tls.cert_path` | string | no | Certificate presented to the endpoint. This is what names the caller. Omitting it leaves the collector unidentified, which a listener enforcing access will refuse. |
-| `load.tls.key_path` | string | no | Private key for `cert_path`. |
+| `signals_endpoint` | string | no | Signals endpoint on the local operator. Defaults to the operator's own service in this namespace, which is where it is unless a deployment renamed it. That this is polled on an interval, held in a window and aged out is how the filter does its job, not something a deployment describes. |
+| `signals_tls` | LoadTls | no | Client material presented to the signals endpoint, when it asks. |
+| `signals_tls.ca_path` | string | yes | CA bundle the endpoint's certificate is verified against. |
+| `signals_tls.cert_path` | string | no | Certificate presented to the endpoint. This is what names the caller. Omitting it leaves the collector unidentified, which a listener enforcing access will refuse. |
+| `signals_tls.key_path` | string | no | Private key for `cert_path`. |
+| `signals` | SignalConfig[] | no | What to score candidates on, in order, each with its weight. Omitted, this is queue depth and KV cache utilisation at equal weight, which is what the endpoint picker scores a pool on. |
+| `signals[].key` | string | yes | What this signal is called by the source that publishes it. A key rather than a name, because it is not this entry's own identity: it addresses a value in the source's keyspace. Nothing here assumes that value came from a scraped metric. A key the source does not publish is not an error. The signal says nothing about any candidate, and the others decide the route. |
+| `signals[].weight` | number | no | Relative weight in the combined score. |
+| `signals[].lower_is_better` | bool | no | Whether a lower reading is the better one. True for queue depth and utilisation alike, which is why it is the default. |
+| `signals[].scale` | `relative` \| `ratio` | no | How the reading becomes a rating. |
+| `signals[].deadband` | number | no | Spread below which candidates are treated as equal on this signal. In the signal's own units, not in rating units. Relative scaling turns whatever spread exists into the full 0..1 range, so half a queued request reads as decisively as two hundred. That sends every request across a region to a pool that is emptier by nothing. Below the deadband the signal expresses no preference, and the decision falls to the other signals, then to the order the overlay rendered, which is by locality. A tie is resolved by being closer. The value has to clear two costs. Moving buys queue time and pays network time, so it is worth it above `(L_remote - L_local) / T_service` in queue units. And the reading describes the past, so it has to exceed how far the difference drifts within one poll. |
+| `signals_max_age_ms` | integer | no | How long a scraped sample stays usable for scoring, in milliseconds. A candidate whose freshest sample is older than this scores as unscored, and a set with any unscored candidate falls back to the rendered order. Tune this against a site's real propagation lag (scrape -> operator -> poll): too tight and live routing keeps falling back; too loose and a site that has stopped reporting keeps winning on a stale reading. Omitted, the default applies. |
+| `signals_interval_ms` | integer | no | How often the signals endpoint is polled, in milliseconds. Omitted, the default applies. |
+| `signals_window_secs` | integer | no | How much history each series retains, in seconds. Omitted, the default applies. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
@@ -84,3 +86,4 @@ Supports two modes:
 | `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
 | `session_affinity.header` | string | no | Header name to extract the session key from. |
 | `session_affinity.ttl_secs` | integer | no | Binding TTL in seconds (default: 3600, max: 86400). |
+| `emit_decision_header` | bool | no | Echo the routing decision back on the response, for debugging. Off by default. When on, each routed response carries the picked site and a compact scoreboard summary so a client can see, per request, where it was sent and why. The full decision, with per-signal freshness, rides the routing trace span (see the `opentelemetry` feature). |

@@ -749,8 +749,8 @@ mod replay {
 
         println!("\n  LLM-D LOAD-BASED ROUTING  (real scorer, replayed signals)\n");
         println!(
-            "  {:>5}   {:>12}  {:>12}     {}",
-            "t(s)", "pool-a queue", "pool-b queue", "route"
+            "  {:>5}   {:>12}  {:>12}     route",
+            "t(s)", "pool-a queue", "pool-b queue"
         );
         println!("  {}", "-".repeat(52));
 

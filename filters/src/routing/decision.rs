@@ -289,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "exercises the full decision summary")]
     fn summary_names_pick_and_reports_freshness() {
         let a = candidate("site-a", "inf-a");
         let b = candidate("site-b", "inf-b");

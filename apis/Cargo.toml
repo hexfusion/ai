@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["store"]
+default = ["store", "praxis-main"]
 store = ["dep:sqlx", "dep:dashmap"]
 praxis-main = []
 
