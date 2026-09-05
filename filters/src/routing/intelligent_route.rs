@@ -36,6 +36,7 @@ use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Re
 use serde::Deserialize;
 
 use super::{
+    decision,
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
     load,
     metadata::{
@@ -59,6 +60,18 @@ const MAX_BINDINGS: usize = 10_000;
 
 /// Maximum session affinity TTL in seconds (24 hours).
 const MAX_TTL_SECS: u64 = 86_400;
+
+/// Metadata key carrying the picked site from the request phase to the response.
+const DECISION_ROUTE_META: &str = "intelligent_route.decision.route";
+
+/// Metadata key carrying the compact decision summary to the response phase.
+const DECISION_SUMMARY_META: &str = "intelligent_route.decision.summary";
+
+/// Response header naming the site a request was routed to.
+const DECISION_ROUTE_HEADER: &str = "x-grid-route";
+
+/// Response header carrying the compact routing-decision summary.
+const DECISION_SUMMARY_HEADER: &str = "x-grid-decision";
 
 // -----------------------------------------------------------------------------
 // Config
@@ -118,6 +131,27 @@ struct IntelligentRouteConfig {
     #[serde(default = "load::default_signals")]
     signals: Vec<load::SignalConfig>,
 
+    /// How long a scraped sample stays usable for scoring, in milliseconds.
+    ///
+    /// A candidate whose freshest sample is older than this scores as unscored,
+    /// and a set with any unscored candidate falls back to the rendered order.
+    /// Tune this against a site's real propagation lag (scrape -> operator ->
+    /// poll): too tight and live routing keeps falling back; too loose and a
+    /// site that has stopped reporting keeps winning on a stale reading.
+    /// Omitted, the default applies.
+    #[serde(default)]
+    signals_max_age_ms: Option<i64>,
+
+    /// How often the signals endpoint is polled, in milliseconds. Omitted, the
+    /// default applies.
+    #[serde(default)]
+    signals_interval_ms: Option<u64>,
+
+    /// How much history each series retains, in seconds. Omitted, the default
+    /// applies.
+    #[serde(default)]
+    signals_window_secs: Option<u64>,
+
     /// Name of the local site (required in static mode, provided by overlay
     /// in overlay mode).
     local_site: Option<String>,
@@ -158,6 +192,15 @@ struct IntelligentRouteConfig {
 
     /// Session affinity configuration (disabled by default).
     session_affinity: Option<SessionAffinityConfig>,
+
+    /// Echo the routing decision back on the response, for debugging.
+    ///
+    /// Off by default. When on, each routed response carries the picked site and
+    /// a compact scoreboard summary so a client can see, per request, where it
+    /// was sent and why. The full decision, with per-signal freshness, rides the
+    /// routing trace span (see the `opentelemetry` feature).
+    #[serde(default)]
+    emit_decision_header: bool,
 }
 
 /// Hot reload settings for overlay file watching.
@@ -434,6 +477,8 @@ pub struct IntelligentRouteFilter {
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
     /// Live load signals, when configured.
     load: Option<LoadRouting>,
+    /// Echo the routing decision on the response for debugging.
+    emit_decision_header: bool,
 }
 
 /// Live load signals and the scorers reading them.
@@ -462,9 +507,11 @@ impl IntelligentRouteFilter {
     /// - the overlay file cannot be read or parsed
     /// - the candidate list is empty or invalid
     /// - the model header is invalid
+    #[expect(clippy::too_many_lines, reason = "two-mode construction plus decision-echo wiring")]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
+        let emit_decision_header = cfg.emit_decision_header;
         // Before anything moves out of `cfg`, since this reads two of its
         // fields together.
         let load = load_routing_from(&cfg)?;
@@ -498,6 +545,7 @@ impl IntelligentRouteFilter {
             session_affinity,
             snapshot,
             load,
+            emit_decision_header,
         }))
     }
 
@@ -529,12 +577,13 @@ impl IntelligentRouteFilter {
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
-        let Some(c) = select_admitted(
+        let selected = select_admitted(
             &snap.candidates,
             kind,
             name,
             self.load.as_ref().map(|l| l.scorers.as_slice()),
-        ) else {
+        );
+        let Some(c) = selected.chosen else {
             // 404 says the route does not exist, which is what a caller acts on
             // when they got the model name wrong. A grid that is briefly unable
             // to serve is a different fact, and answering both the same way
@@ -556,16 +605,85 @@ impl IntelligentRouteFilter {
             &self.provider_hop_clusters,
             snap.semantic_revision.as_ref(),
         )?;
+        if self.decision_recording_enabled() {
+            self.record_decision(ctx, &selected, c, snap, kind, name);
+        }
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
         }
         Ok(FilterAction::Continue)
     }
+
+    /// Whether a routing decision record is worth building for this request.
+    ///
+    /// Only when someone consumes it: the response-header echo is on, or the
+    /// routing trace span is compiled in.
+    const fn decision_recording_enabled(&self) -> bool {
+        self.emit_decision_header || cfg!(feature = "opentelemetry")
+    }
+
+    /// Build the routing decision record and route it to its consumers: the
+    /// trace span, and the compact response-header echo.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routes the decision from the full selection context"
+    )]
+    fn record_decision(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        selected: &Selected<'_>,
+        chosen: &RouteCandidate,
+        snap: &RouteSnapshot,
+        kind: CapabilityKind,
+        name: &str,
+    ) {
+        // A candidate went unscored and the pick fell back to the rendered
+        // order. This is the freshness case worth seeing on its own.
+        let fallback = selected.basis == BASIS_NO_FRESH_SIGNAL;
+        let signals = self
+            .load
+            .as_ref()
+            .map(|l| scoring::readings(&l.scorers, &selected.admitted, load::now_ms()))
+            .unwrap_or_default();
+        let decision = decision::RoutingDecision::build(
+            &selected.admitted,
+            &selected.scores,
+            &signals,
+            chosen,
+            selected.basis,
+            fallback,
+            &snap.local_site,
+            kind,
+            name,
+        );
+        #[cfg(feature = "opentelemetry")]
+        crate::opentelemetry::record_routing_decision(
+            &decision,
+            chosen,
+            &snap.local_site,
+            snap.semantic_revision.as_ref(),
+        );
+        if self.emit_decision_header {
+            ctx.set_metadata(DECISION_ROUTE_META, decision.route());
+            ctx.set_metadata(DECISION_SUMMARY_META, decision.summary());
+        }
+    }
 }
 
 /// Start the load collector described by `config`.
 fn load_routing_from(cfg: &IntelligentRouteConfig) -> Result<Option<LoadRouting>, FilterError> {
-    let source = load::LoadConfig::polling(cfg.signals_endpoint.clone(), cfg.signals_tls.clone());
+    let mut source = load::LoadConfig::polling(cfg.signals_endpoint.clone(), cfg.signals_tls.clone());
+    // Freshness/windowing overrides, so the grid can be tuned to a site's real
+    // propagation lag without a rebuild. Each keeps its default when unset.
+    if let Some(max_age_ms) = cfg.signals_max_age_ms {
+        source.max_age_ms = max_age_ms;
+    }
+    if let Some(interval_ms) = cfg.signals_interval_ms {
+        source.interval_ms = interval_ms;
+    }
+    if let Some(window_secs) = cfg.signals_window_secs {
+        source.window_secs = window_secs;
+    }
     build_load_routing(&source, &cfg.signals).map(Some)
 }
 
@@ -748,6 +866,40 @@ impl HttpFilter for IntelligentRouteFilter {
 
         self.select_and_route(ctx, &snap, kind, &name)
     }
+
+    async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if !self.emit_decision_header {
+            return Ok(FilterAction::Continue);
+        }
+        // Read the decision out of metadata before borrowing the response, so the
+        // immutable metadata borrow does not overlap the mutable header borrow.
+        let route = ctx
+            .get_metadata(DECISION_ROUTE_META)
+            .and_then(|v| HeaderValue::from_str(v).ok());
+        let summary = ctx
+            .get_metadata(DECISION_SUMMARY_META)
+            .and_then(|v| HeaderValue::from_str(v).ok());
+        let Some(response) = ctx.response_header.as_mut() else {
+            return Ok(FilterAction::Continue);
+        };
+        let mut wrote = false;
+        if let Some(route) = route {
+            response
+                .headers
+                .insert(HeaderName::from_static(DECISION_ROUTE_HEADER), route);
+            wrote = true;
+        }
+        if let Some(summary) = summary {
+            response
+                .headers
+                .insert(HeaderName::from_static(DECISION_SUMMARY_HEADER), summary);
+            wrote = true;
+        }
+        if wrote {
+            ctx.response_headers_modified = true;
+        }
+        Ok(FilterAction::Continue)
+    }
 }
 
 /// Apply a reused (session-affinity-bound) candidate.
@@ -780,8 +932,8 @@ fn apply_route(
     ctx.cluster = Some(Arc::clone(&candidate.cluster));
     record_route_decision(ctx, local_site, candidate);
     write_provider_context(ctx, candidate, provider_hop_clusters, semantic_revision)?;
-    #[cfg(feature = "opentelemetry")]
-    crate::opentelemetry::record_routing_selection(candidate, local_site, semantic_revision);
+    // The routing span for this path is emitted by `record_decision`, which
+    // carries the full scoreboard; the winner-only span would double it.
     Ok(())
 }
 
@@ -1011,39 +1163,72 @@ fn evict_expired(affinity: &SessionAffinity) {
 ///
 /// [`Excluded`]: AdmissionState::Excluded
 /// [`ExistingOnly`]: AdmissionState::ExistingOnly
+#[expect(
+    clippy::too_many_lines,
+    reason = "basis classification across the three selection paths"
+)]
 fn select_admitted<'a>(
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
     scorers: Option<&[Box<dyn scoring::Scorer>]>,
-) -> Option<&'a RouteCandidate> {
+) -> Selected<'a> {
     let (admitted, degraded) = admissible(candidates, kind, name);
     let first = admitted.first().copied();
     let Some(scorers) = scorers else {
-        record_route_decision_basis(
-            first,
-            if degraded {
-                BASIS_SATURATED
-            } else {
-                BASIS_NO_LOAD_SOURCE
-            },
-        );
-        return first;
+        let basis = if degraded {
+            BASIS_SATURATED
+        } else {
+            BASIS_NO_LOAD_SOURCE
+        };
+        record_route_decision_basis(first, basis);
+        return Selected {
+            chosen: first,
+            basis,
+            admitted,
+            scores: Vec::new(),
+        };
     };
     let scores = scoring::score_all(scorers, &admitted, load::now_ms());
     if let Some(chosen) = scoring::pick(&admitted, &scores) {
-        record_route_decision_basis(Some(chosen), if degraded { BASIS_SATURATED } else { BASIS_LIVE_LOAD });
-        return Some(chosen);
+        let basis = if degraded { BASIS_SATURATED } else { BASIS_LIVE_LOAD };
+        record_route_decision_basis(Some(chosen), basis);
+        return Selected {
+            chosen: Some(chosen),
+            basis,
+            admitted,
+            scores,
+        };
     }
-    record_route_decision_basis(
-        first,
-        if degraded {
-            BASIS_SATURATED
-        } else {
-            BASIS_NO_FRESH_SIGNAL
-        },
-    );
-    first
+    let basis = if degraded {
+        BASIS_SATURATED
+    } else {
+        BASIS_NO_FRESH_SIGNAL
+    };
+    record_route_decision_basis(first, basis);
+    Selected {
+        chosen: first,
+        basis,
+        admitted,
+        scores,
+    }
+}
+
+/// The outcome of admitting and scoring candidates: the pick, the why-class, and
+/// the scoreboard it came from.
+///
+/// The scoreboard is carried out so the decision can be recorded without scoring
+/// a second time.
+struct Selected<'a> {
+    /// The routed candidate, or `None` when nothing serves this capability.
+    chosen: Option<&'a RouteCandidate>,
+    /// Why-class recorded for this decision.
+    basis: &'static str,
+    /// Candidates that were in the running, in scored order.
+    admitted: Vec<&'a RouteCandidate>,
+    /// Combined score per admitted candidate, aligned to `admitted`. Empty when
+    /// no load source is configured.
+    scores: Vec<Option<f64>>,
 }
 
 /// Candidates that may take this request, and whether that took a downgrade.
@@ -1805,6 +1990,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            emit_decision_header: false,
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -1958,6 +2144,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            emit_decision_header: false,
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
@@ -2660,6 +2847,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
+            emit_decision_header: false,
         };
 
         let mut first = crate::test_utils::make_request(Method::POST, "/chat");
@@ -2707,6 +2895,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
+            emit_decision_header: false,
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
@@ -2959,6 +3148,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
+            emit_decision_header: false,
         }
     }
 

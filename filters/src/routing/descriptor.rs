@@ -191,14 +191,8 @@ pub(crate) struct RouteCandidate {
     pub credential: Option<CandidateCredential>,
 
     /// Whether this candidate is fresh. Preserved from overlay/static config;
-    /// the configuration producer owns freshness ordering.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "preserved from overlay/static config; producer owns freshness ordering"
-        )
-    )]
+    /// the configuration producer owns freshness ordering. Surfaced in the
+    /// routing decision record as `overlay_fresh`.
     pub fresh: bool,
 
     /// Capability kind.

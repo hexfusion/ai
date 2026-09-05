@@ -9,6 +9,7 @@
 //! generic Praxis proxy mechanics.
 
 mod credential_inject;
+pub(crate) mod decision;
 pub(crate) mod descriptor;
 mod intelligent_route;
 pub(crate) mod load;

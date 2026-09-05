@@ -16,6 +16,19 @@ WORKDIR /src
 # Cache Build
 # ------------------------------------------------------------------------------
 
+# The praxis sources the workspace is patched onto.
+#
+# [patch.crates-io] points at ../../../praxis, which from /src collapses to
+# /praxis, because a parent of the root is still the root. Nothing outside the
+# build context resolves during a container build, so praxis arrives as its own
+# context and lands where the patch already looks.
+#
+#   podman build --build-context praxis=<a praxis checkout> ...
+#
+# Demo-only. It comes out when the praxis release carries per_identity and the
+# patch reverts to a version bump.
+COPY --from=praxis . /praxis
+
 # Cache dependency builds: copy only manifests first, then
 # create stub source files so `cargo build` resolves and
 # compiles all dependencies without the real source code.
@@ -58,7 +71,7 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine
+    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine,opentelemetry
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -82,7 +95,7 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine \
+    cargo build --release -p praxis-ai-proxy --features praxis-main,policy-engine,opentelemetry \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------

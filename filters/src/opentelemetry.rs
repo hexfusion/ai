@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tracing::field::Empty;
 
-use crate::routing::descriptor::RouteCandidate;
+use crate::routing::{decision::RoutingDecision, descriptor::RouteCandidate};
 
 /// Borrowed, validated attributes for a routing decision span.
 struct RoutingSelection<'a> {
@@ -96,6 +96,51 @@ pub(crate) fn record_routing_selection(
     let _entered = span.enter();
 }
 
+/// Emit a routing decision span carrying the full scoreboard the pick came from.
+///
+/// This is the winner span of [`record_routing_selection`] plus the why: the
+/// decision basis, whether it fell back off live load, and the per-candidate
+/// scoreboard as a bounded JSON document. A trace sink renders that document to
+/// debug the routing stage without redeploying it.
+///
+/// The document is routing state only. No prompt, body, credential,
+/// authorization header, cookie, session key, or raw request identifier is
+/// recorded. When the feature is disabled this call site is compiled out.
+pub(crate) fn record_routing_decision(
+    decision: &RoutingDecision,
+    candidate: &RouteCandidate,
+    local_site: &Arc<str>,
+    semantic_revision: Option<&Arc<str>>,
+) {
+    let selection = RoutingSelection::from_candidate(candidate, local_site, semantic_revision);
+    let span = tracing::info_span!(
+        "routing.select",
+        "selected.provider" = selection.provider,
+        "selected.cluster" = selection.cluster,
+        "selected.site" = selection.site,
+        "selected.stable_id" = selection.stable_id,
+        "routing.admission_state" = selection.admission_state,
+        "routing.kind" = selection.kind,
+        "routing.local_site" = selection.local_site,
+        "routing.basis" = decision.basis(),
+        "routing.fallback" = decision.fallback(),
+        "routing.decision" = %decision.to_json(),
+        "routing.rank" = Empty,
+        "routing.selection_tier" = Empty,
+        "overlay.revision" = Empty,
+    );
+    if let Some(rank) = selection.rank {
+        span.record("routing.rank", rank);
+    }
+    if let Some(tier) = selection.tier {
+        span.record("routing.selection_tier", tier);
+    }
+    if let Some(revision) = selection.revision {
+        span.record("overlay.revision", revision);
+    }
+    let _entered = span.enter();
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -153,6 +198,7 @@ mod tests {
         RouteCandidate {
             admission_state: AdmissionState::NewAndExisting,
             cluster: Arc::from("provider-a"),
+            credential: None,
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model-a"),

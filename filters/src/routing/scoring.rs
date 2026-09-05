@@ -54,6 +54,102 @@ pub(crate) trait Scorer: Send + Sync {
     fn weight(&self) -> f64 {
         1.0
     }
+
+    /// The signal this scorer rates, for observability labelling.
+    ///
+    /// Used only to name a candidate's reading in the decision record; it never
+    /// affects selection.
+    fn metric_name(&self) -> &str {
+        "score"
+    }
+
+    /// Per-candidate reading with the freshness that decided whether it counted.
+    ///
+    /// This is the observability twin of [`measure`]: it reports the same value
+    /// plus the age and freshness a decision was actually made on, so a routing
+    /// choice can be explained after the fact. It never affects selection.
+    ///
+    /// The default reports the measured value with no age, so a scorer that has
+    /// no notion of freshness still surfaces its reading. A scorer backed by a
+    /// windowed store overrides this to fill in age and staleness.
+    ///
+    /// [`measure`]: Scorer::measure
+    fn read(&self, candidates: &[&RouteCandidate], now_ms: i64) -> Vec<Reading> {
+        self.measure(candidates, now_ms)
+            .into_iter()
+            .map(|value| Reading {
+                value,
+                age_ms: None,
+                fresh: value.is_some(),
+            })
+            .collect()
+    }
+}
+
+/// One candidate's reading of one signal, with the freshness that decided
+/// whether it counted toward the score.
+///
+/// The value is reported even when stale. A stale reading is *why* a candidate
+/// went unscored, so hiding it would hide the reason a decision was made.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reading {
+    /// Most recent value seen, fresh or not. `None` when the signal has no
+    /// sample for this candidate at all.
+    pub value: Option<f64>,
+
+    /// Age of that value in milliseconds. `None` when there is no sample.
+    pub age_ms: Option<i64>,
+
+    /// Whether the value was fresh enough to score on.
+    pub fresh: bool,
+}
+
+/// One scorer's labelled, weighted reading of one candidate.
+///
+/// The decision record is built from a list of these, so adding a [`Scorer`]
+/// adds a line to every candidate's record with no change to the record shape
+/// or the tools that read it.
+#[derive(Clone, Debug)]
+pub(crate) struct SignalReading {
+    /// The signal's metric name, from [`Scorer::metric_name`].
+    pub metric: Box<str>,
+
+    /// The scorer's weight in the combined score.
+    pub weight: f64,
+
+    /// The reading and its freshness.
+    pub reading: Reading,
+}
+
+/// Every scorer's reading of every candidate, in candidate order.
+///
+/// Extensible by construction: a new [`Scorer`] contributes a [`SignalReading`]
+/// to each candidate here without any change to the decision record downstream.
+pub(crate) fn readings(
+    scorers: &[Box<dyn Scorer>],
+    candidates: &[&RouteCandidate],
+    now_ms: i64,
+) -> Vec<Vec<SignalReading>> {
+    let per_scorer: Vec<(Box<str>, f64, Vec<Reading>)> = scorers
+        .iter()
+        .map(|s| (Box::from(s.metric_name()), s.weight(), s.read(candidates, now_ms)))
+        .collect();
+    (0..candidates.len())
+        .map(|index| {
+            per_scorer
+                .iter()
+                .map(|(metric, weight, per_candidate)| SignalReading {
+                    metric: metric.clone(),
+                    weight: *weight,
+                    reading: per_candidate.get(index).copied().unwrap_or(Reading {
+                        value: None,
+                        age_ms: None,
+                        fresh: false,
+                    }),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Whether the candidates differ by less than this signal can meaningfully
@@ -160,6 +256,28 @@ impl Scorer for MetricScorer {
 
     fn weight(&self) -> f64 {
         self.weight
+    }
+
+    fn metric_name(&self) -> &str {
+        &self.metric
+    }
+
+    fn read(&self, candidates: &[&RouteCandidate], now_ms: i64) -> Vec<Reading> {
+        candidates
+            .iter()
+            .map(|c| {
+                let key = LoadStore::key(&c.site, &c.cluster);
+                // The latest sample regardless of age explains a stale reading;
+                // `fresh` is what selection actually used.
+                let latest = self.store.latest(&key, &self.metric);
+                let fresh = self.store.fresh(&key, &self.metric, now_ms, self.max_age_ms).is_some();
+                Reading {
+                    value: latest.map(|s| s.value),
+                    age_ms: latest.map(|s| now_ms - s.at_ms),
+                    fresh,
+                }
+            })
+            .collect()
     }
 }
 
@@ -612,5 +730,57 @@ mod replay {
                 }
             }
         }
+    }
+
+    /// Not an assertion. Prints a per-scrape scorecard so the pool-a to pool-b to
+    /// pool-a routing transition is visible in the terminal, driven by the real
+    /// scorer over the recorded signal trace.
+    ///
+    ///   `cargo test -p praxis-ai-filters --features praxis-main replay_scorecard -- --nocapture --ignored`
+    #[test]
+    #[ignore = "prints a routing scorecard rather than asserting"]
+    #[expect(clippy::print_stdout, reason = "the scorecard is the point of this one")]
+    fn replay_scorecard() {
+        let store = Arc::new(LoadStore::new(std::time::Duration::from_secs(60)));
+        let scorers = tuned(&store, 1.0, 1.0, 0.05);
+        let local = candidate("pool-a", "llmd-pool-a-provider");
+        let remote = candidate("pool-b", "llmd-pool-b-provider");
+        let candidates = [&local, &remote];
+
+        println!("\n  LLM-D LOAD-BASED ROUTING  (real scorer, replayed signals)\n");
+        println!(
+            "  {:>5}   {:>12}  {:>12}     {}",
+            "t(s)", "pool-a queue", "pool-b queue", "route"
+        );
+        println!("  {}", "-".repeat(52));
+
+        let start = trace().first().map_or(0, |s| s.at_ms);
+        let mut last = String::new();
+        for scrape in trace() {
+            store.ingest(&scrape.body);
+            let scores = score_all(&scorers, &candidates, scrape.at_ms);
+            let route = pick(&candidates, &scores).map_or_else(|| "none".to_owned(), |c| c.site.to_string());
+            let qa = queue_of(&scrape.body, "pool-a");
+            let qb = queue_of(&scrape.body, "pool-b");
+            let secs = (scrape.at_ms - start) / 1000;
+            let flip = if !last.is_empty() && route != last {
+                "   <== flip"
+            } else {
+                ""
+            };
+            println!("  {secs:>5}   {qa:>12.1}  {qb:>12.1}     -> {route}{flip}");
+            last = route;
+        }
+        println!();
+    }
+
+    /// Read one site's queue-size gauge out of a recorded scrape body, for display.
+    fn queue_of(body: &str, site: &str) -> f64 {
+        let needle = format!("grid_site=\"{site}\"");
+        body.lines()
+            .find(|line| line.starts_with(QUEUE) && line.contains(&needle))
+            .and_then(|line| line.split_whitespace().nth_back(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
     }
 }

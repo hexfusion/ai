@@ -303,3 +303,22 @@ invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
 
+
+# Demo-only, so the gateway image carries rate_limit per_identity before that
+# work is released. praxis on upstream/main is the same 0.5.3, so this is a
+# drop-in rather than a version bump, and it reverts to a plain bump once the
+# praxis PR lands.
+[patch.crates-io]
+praxis-proxy-core = { path = "../../../praxis/core" }
+praxis-proxy-filter = { path = "../../../praxis/filter" }
+praxis-proxy-protocol = { path = "../../../praxis/protocol" }
+praxis-proxy-tls = { path = "../../../praxis/tls" }
+praxis-proxy = { path = "../../../praxis/server" }
+
+# The pingora fork carries URI SAN extraction (SPIFFE URI SANs) that SslDigest
+# upstream lacks, and per_identity reads it. This must live here too: [patch]
+# only applies from the root workspace, so praxis's own patch does not reach a
+# path-dependency build of praxis-proxy-protocol.
+quixotic-plecostomus-core = { git = "https://github.com/hexfusion/pingora", rev = "28acf2264c645cdac791c330d488d9023e25dfba" }
+quixotic-plecostomus-http = { git = "https://github.com/hexfusion/pingora", rev = "28acf2264c645cdac791c330d488d9023e25dfba" }
+quixotic-plecostomus-proxy = { git = "https://github.com/hexfusion/pingora", rev = "28acf2264c645cdac791c330d488d9023e25dfba" }
