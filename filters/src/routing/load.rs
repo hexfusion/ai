@@ -724,10 +724,11 @@ impl LoadConfig {
     }
 }
 
-/// The operator's signals endpoint, as it is addressed from inside the
-/// cluster it runs in.
+/// The default signals endpoint: the operator's cross-site mTLS rollup, which
+/// needs the grid client identity via `signals_tls`. The single-site
+/// `/metrics` exporter on the same host is the configurable alternative.
 pub(crate) fn default_signals_endpoint() -> String {
-    "https://grid-operator-signals:9091/metrics".to_owned()
+    "https://grid-operator-signals:9091/v1/site/signals".to_owned()
 }
 
 /// The signals a grid scores on when it names none: the two the endpoint
