@@ -65,6 +65,7 @@ pub(crate) struct LoadConfig {
     ///
     /// Unqualified it carries the local site and every collected peer. Adding
     /// `?target=<site>` narrows it to one and leaves remote candidates unscored.
+    #[serde(default = "default_signals_endpoint")]
     pub endpoint: String,
 
     /// Poll interval, in milliseconds.
@@ -90,6 +91,11 @@ pub(crate) struct LoadConfig {
     /// with no grid CA trust and indistinguishable from any other caller.
     #[serde(default)]
     pub tls: Option<LoadTls>,
+
+    /// Signals to score candidates on. Also the metric names polled, so an
+    /// unlisted signal is neither collected nor scored.
+    #[serde(default = "default_signals")]
+    pub signals: Vec<SignalConfig>,
 }
 
 /// Default poll interval.
@@ -256,6 +262,11 @@ impl LoadStore {
             let Some(observation) = parse_line(line) else {
                 continue;
             };
+            // A non-finite value (NaN or infinity) would poison window_worst,
+            // where it can survive as the sole in-window reading.
+            if !observation.value.is_finite() {
+                continue;
+            }
             let key = Self::key(observation.site, observation.cluster);
             if !self.providers.contains_key(&key) && self.providers.len() >= MAX_PROVIDERS {
                 continue;
@@ -513,21 +524,6 @@ fn build_url(endpoint: &str, collect: &[String]) -> String {
         .join("&");
     let separator = if endpoint.contains('?') { '&' } else { '?' };
     format!("{endpoint}{separator}{query}")
-}
-
-impl LoadConfig {
-    /// A collector for one endpoint at this filter's default cadences. A
-    /// deployment names the endpoint and what to score on, not the intervals.
-    pub fn polling(endpoint: String, tls: Option<LoadTls>) -> Self {
-        Self {
-            endpoint,
-            interval_ms: default_interval_ms(),
-            window_secs: default_window_secs(),
-            max_age_ms: default_max_age_ms(),
-            timeout_ms: default_timeout_ms(),
-            tls,
-        }
-    }
 }
 
 /// The default signals endpoint: the operator's cross-site mTLS rollup, which
