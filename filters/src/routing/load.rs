@@ -570,6 +570,33 @@ const fn default_lower_is_better() -> bool {
     true
 }
 
+/// Reject a non-finite or non-positive `weight`. A non-finite weight poisons the
+/// combined score with `NaN`, which then wins every pick. Zero erases the signal
+/// and a negative inverts it, routing to the worst candidate. All silent.
+fn deserialize_signal_weight<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(serde::de::Error::custom("weight must be finite and greater than zero"));
+    }
+    Ok(value)
+}
+
+/// Reject a non-finite or negative `deadband`. A non-finite band suppresses every
+/// spread, so the signal never expresses a preference. A negative one is meaningless.
+fn deserialize_deadband<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(serde::de::Error::custom("deadband must be finite and not negative"));
+    }
+    Ok(value)
+}
+
 /// One signal the gateway scores candidates on.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -580,7 +607,7 @@ pub(crate) struct SignalConfig {
     pub key: String,
 
     /// Relative weight in the combined score.
-    #[serde(default = "default_signal_weight")]
+    #[serde(default = "default_signal_weight", deserialize_with = "deserialize_signal_weight")]
     pub weight: f64,
 
     /// Whether a lower reading is better. True for queue depth and utilisation,
@@ -600,7 +627,7 @@ pub(crate) struct SignalConfig {
     /// other signals, then to overlay (locality) order. The value should clear
     /// the move's network cost, `(L_remote - L_local) / T_service` in queue
     /// units, and the drift in the difference within one poll.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_deadband")]
     pub deadband: f64,
 }
 
@@ -800,6 +827,35 @@ mod tests {
         let result: Result<LoadConfig, _> =
             serde_yaml::from_str("endpoint: http://operator:9091/metrics\nmax_age_ms: -1\n");
         assert!(result.is_err(), "a negative max_age_ms must be rejected at parse time");
+    }
+
+    #[test]
+    fn a_non_finite_signal_weight_is_rejected() {
+        let result: Result<LoadConfig, _> = serde_yaml::from_str(
+            "endpoint: http://operator:9091/metrics\nsignals:\n  - key: queue\n    weight: .inf\n",
+        );
+        assert!(
+            result.is_err(),
+            "a non-finite weight poisons the combined score with NaN"
+        );
+    }
+
+    #[test]
+    fn a_non_positive_signal_weight_is_rejected() {
+        let result: Result<LoadConfig, _> =
+            serde_yaml::from_str("endpoint: http://operator:9091/metrics\nsignals:\n  - key: queue\n    weight: 0\n");
+        assert!(
+            result.is_err(),
+            "zero or negative weight silently erases or inverts the signal"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_deadband_is_rejected() {
+        let result: Result<LoadConfig, _> = serde_yaml::from_str(
+            "endpoint: http://operator:9091/metrics\nsignals:\n  - key: queue\n    deadband: .inf\n",
+        );
+        assert!(result.is_err(), "a non-finite deadband suppresses every spread");
     }
 
     #[test]
