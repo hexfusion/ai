@@ -294,7 +294,8 @@ enum AffinityOutcome<'a> {
 ///   `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 ///
 /// **Behavior:**
-/// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
+/// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no route-decision metadata is
+///   written, though the configured route header still mirrors the preserved cluster.
 /// - If no routing source is present, the filter returns `Continue` without routing.
 /// - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400.
 /// - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written.
@@ -516,7 +517,7 @@ impl IntelligentRouteFilter {
                 snap.semantic_revision.as_ref(),
                 snap.selection_mode,
             )?;
-            self.emit_route_header(ctx, c);
+            self.emit_route_header(ctx, &c.cluster);
             return Ok(action);
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
@@ -535,34 +536,33 @@ impl IntelligentRouteFilter {
             selection_group,
             snap.selection_mode,
         )?;
-        self.emit_route_header(ctx, c);
+        self.emit_route_header(ctx, &c.cluster);
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
         }
         Ok(FilterAction::Continue)
     }
 
-    /// Set the configured route header to the chosen cluster.
+    /// Set the configured route header to the effective cluster.
     ///
-    /// Header-routing gateways (`ext_proc` + Envoy) forward on this header
-    /// rather than reading `ctx.cluster`. A cluster name that is not a valid
-    /// header value is logged and skipped, not fatal.
-    fn emit_route_header(&self, ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) {
+    /// Header-routing gateways forward on this header rather than reading
+    /// `ctx.cluster`. An unencodable cluster name is logged at warn and skipped.
+    fn emit_route_header(&self, ctx: &mut HttpFilterContext<'_>, cluster: &str) {
         let Some(header) = &self.route_header else {
             return;
         };
-        match HeaderValue::from_str(&candidate.cluster) {
+        match HeaderValue::from_str(cluster) {
             Ok(value) => {
                 tracing::debug!(
                     header = %header,
-                    value = %candidate.cluster,
+                    value = %cluster,
                     "intelligent_route: emitting route header"
                 );
                 ctx.request_headers_to_set.push((header.clone(), value));
             },
-            Err(e) => tracing::debug!(
+            Err(e) => tracing::warn!(
                 header = %header,
-                cluster = %candidate.cluster,
+                cluster = %cluster,
                 error = %e,
                 "intelligent_route: route header value not a valid header; not emitting"
             ),
@@ -702,8 +702,10 @@ impl HttpFilter for IntelligentRouteFilter {
             ctx.request_headers_to_remove.push(header.clone());
         }
 
-        if ctx.cluster.is_some() {
+        if let Some(cluster) = ctx.cluster.clone() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
+            // Mirror the preserved cluster onto the route header for a header-routing gateway.
+            self.emit_route_header(ctx, &cluster);
             return Ok(FilterAction::Continue);
         }
 
@@ -1759,6 +1761,35 @@ mod tests {
             emitted_dest_header(&ctx).as_deref(),
             Some("cluster-v1"),
             "the pick overwrites a forged route header"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_header_mirrors_a_pre_set_cluster() {
+        // A preserved pre-set cluster still emits the route header; a forged client value is stripped.
+        let filter = route_header_filter(
+            Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))),
+            Some(DEST_HEADER),
+            None,
+        );
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(DEST_HEADER, HeaderValue::from_static("attacker-cluster"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("pre-set-cluster"));
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("pre-set-cluster"),
+            "the pre-set cluster is preserved"
+        );
+        assert!(dest_header_stripped(&ctx), "the forged client value is stripped");
+        assert_eq!(
+            emitted_dest_header(&ctx).as_deref(),
+            Some("pre-set-cluster"),
+            "the route header mirrors the preserved cluster for a header-routing gateway"
         );
     }
 
