@@ -58,6 +58,7 @@ Supports two modes:
 | `candidates[].traffic_weight` | integer | no | Optional bounded weight used only by weighted selection. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
+| `route_header` | string | no | Request header set to the chosen cluster's name, for a gateway that routes by header (`ext_proc` + Envoy) rather than reading `ctx.cluster` through a downstream `load_balancer` filter. Unset, none is emitted. |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
 | `expected_overlay_scope` | ExpectedOverlayScope | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
 | `expected_overlay_scope.network` | string | no | Expected network name. |
