@@ -69,7 +69,7 @@ pub(crate) struct LoadConfig {
     pub endpoint: String,
 
     /// Poll interval, in milliseconds.
-    #[serde(default = "default_interval_ms")]
+    #[serde(default = "default_interval_ms", deserialize_with = "deserialize_interval_ms")]
     pub interval_ms: u64,
 
     /// Retention per series, in seconds.
@@ -84,7 +84,7 @@ pub(crate) struct LoadConfig {
     pub max_age_ms: i64,
 
     /// Request timeout, in milliseconds.
-    #[serde(default = "default_timeout_ms")]
+    #[serde(default = "default_timeout_ms", deserialize_with = "deserialize_timeout_ms")]
     pub timeout_ms: u64,
 
     /// TLS material for the endpoint. Without it the collector is a plain client,
@@ -122,6 +122,31 @@ where
     let value = i64::deserialize(deserializer)?;
     if value < 0 {
         return Err(serde::de::Error::custom("max_age_ms must not be negative"));
+    }
+    Ok(value)
+}
+
+/// Reject a zero `interval_ms`: `tokio::time::interval` panics on a zero period.
+fn deserialize_interval_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("interval_ms must be greater than zero"));
+    }
+    Ok(value)
+}
+
+/// Reject a zero `timeout_ms`: a zero request timeout elapses immediately, so
+/// every poll fails before it can read a sample.
+fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("timeout_ms must be greater than zero"));
     }
     Ok(value)
 }
@@ -268,6 +293,8 @@ impl LoadStore {
                 continue;
             }
             let key = Self::key(observation.site, observation.cluster);
+            // Not atomic with the entry() insert below, but only the single
+            // collector poll thread calls ingest, so the cap holds by construction.
             if !self.providers.contains_key(&key) && self.providers.len() >= MAX_PROVIDERS {
                 continue;
             }
@@ -827,6 +854,26 @@ mod tests {
         let result: Result<LoadConfig, _> =
             serde_yaml::from_str("endpoint: http://operator:9091/metrics\nmax_age_ms: -1\n");
         assert!(result.is_err(), "a negative max_age_ms must be rejected at parse time");
+    }
+
+    #[test]
+    fn interval_ms_rejects_zero() {
+        let result: Result<LoadConfig, _> =
+            serde_yaml::from_str("endpoint: http://operator:9091/metrics\ninterval_ms: 0\n");
+        assert!(
+            result.is_err(),
+            "a zero interval_ms panics tokio::time::interval; reject at parse time"
+        );
+    }
+
+    #[test]
+    fn timeout_ms_rejects_zero() {
+        let result: Result<LoadConfig, _> =
+            serde_yaml::from_str("endpoint: http://operator:9091/metrics\ntimeout_ms: 0\n");
+        assert!(
+            result.is_err(),
+            "a zero timeout_ms fails every poll immediately; reject at parse time"
+        );
     }
 
     #[test]
