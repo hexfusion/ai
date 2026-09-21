@@ -3522,7 +3522,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
- "dashmap",
  "futures",
  "http 1.5.0",
  "jsonschema",
