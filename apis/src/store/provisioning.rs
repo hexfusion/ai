@@ -10,14 +10,14 @@
 //! Postgres transient connect is retryable), compute the dedup key, and close
 //! the pool on retirement.
 
-#[cfg(feature = "store-sqlite")]
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
 use praxis_ai_store::BackendError;
 
 /// Scrub a connection string, and any credentials embedded in it, from an error
 /// message before it reaches [`StoreError::Database`] or a log line.
 ///
 /// [`StoreError::Database`]: praxis_ai_store::StoreError::Database
-#[cfg(feature = "store-sqlite")]
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
 pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
     let base = message.replace(url, "<redacted database url>");
     // Best effort for a `scheme://user:pass@host` credential echoed separately
@@ -36,6 +36,26 @@ pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
 #[cfg(feature = "store-sqlite")]
 fn permanent(url: &str, message: &str) -> BackendError {
     BackendError::Unavailable(redact_connection_error(url, message))
+}
+
+/// A transient build failure, redacted, so provisioning retries within budget.
+#[cfg(feature = "store-postgres")]
+fn transient(url: &str, message: &str) -> BackendError {
+    BackendError::Transient(redact_connection_error(url, message))
+}
+
+/// A stable fingerprint of the pool overrides for the dedup key.
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+fn pool_fingerprint(pool: Option<&crate::store::PoolConfig>) -> String {
+    pool.map_or_else(
+        || "default".to_owned(),
+        |p| {
+            format!(
+                "{:?}/{:?}/{:?}/{:?}",
+                p.max_connections, p.min_connections, p.idle_timeout_secs, p.acquire_timeout_secs
+            )
+        },
+    )
 }
 
 /// SQLite-backed store-backend factory.
@@ -116,7 +136,7 @@ mod sqlite {
                 cfg.responses_table,
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
-                pool_fingerprint(cfg.pool.as_ref()),
+                super::pool_fingerprint(cfg.pool.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
         }
@@ -144,18 +164,138 @@ mod sqlite {
             })
         }
     }
+}
 
-    /// A stable fingerprint of the pool overrides for the dedup key.
-    fn pool_fingerprint(pool: Option<&PoolConfig>) -> String {
-        pool.map_or_else(
-            || "default".to_owned(),
-            |p| {
-                format!(
-                    "{:?}/{:?}/{:?}/{:?}",
-                    p.max_connections, p.min_connections, p.idle_timeout_secs, p.acquire_timeout_secs
-                )
-            },
-        )
+/// Postgres-backed store-backend factory.
+#[cfg(feature = "store-postgres")]
+#[expect(clippy::allow_attributes, reason = "the factory awaits binary-injection wiring")]
+#[allow(
+    dead_code,
+    reason = "injected by binaries in the deferred server-wiring slice (#1259 slice 5)"
+)]
+mod postgres {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use praxis_ai_store::{EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
+    use secrecy::{ExposeSecret as _, SecretString};
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    use super::{BackendError, transient};
+    use crate::store::{PgTlsConfig, PoolConfig, PostgresResponseStore, SslMode, postgres_url};
+
+    /// Backend id the Postgres factory answers to.
+    pub(crate) const BACKEND_ID: &str = "postgres";
+
+    /// Inline configuration for a Postgres-backed store.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PostgresConfig {
+        /// Postgres connection string.
+        database_url: SecretString,
+        /// Responses table name.
+        responses_table: String,
+        /// Conversations table name.
+        conversations_table: String,
+        /// Optional conversation-items table name.
+        #[serde(default)]
+        items_table: Option<String>,
+        /// Optional connection-pool overrides.
+        #[serde(default)]
+        pool: Option<PoolConfig>,
+        /// TLS verification mode.
+        #[serde(default)]
+        ssl_mode: Option<SslMode>,
+        /// Optional PEM CA the server certificate is verified against.
+        #[serde(default)]
+        ssl_root_cert: Option<SecretString>,
+        /// Permit a private/loopback database host (opt-in).
+        #[serde(default)]
+        allow_private_database_url: bool,
+    }
+
+    /// Retirement hook that closes a Postgres pool.
+    struct PostgresRetire {
+        /// The store whose pool is closed on retirement.
+        store: Arc<PostgresResponseStore>,
+    }
+
+    #[async_trait]
+    impl RetireBackend for PostgresRetire {
+        async fn retire(&self) {
+            self.store.close().await;
+        }
+    }
+
+    /// Provisions Postgres-backed persisted-state stores.
+    pub(crate) struct PostgresBackendFactory;
+
+    impl PostgresBackendFactory {
+        /// Parse the inline config, failing with a config error.
+        fn parse(config: &Value) -> Result<PostgresConfig, BackendError> {
+            serde_json::from_value(config.clone()).map_err(|e| BackendError::Config(e.to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for PostgresBackendFactory {
+        fn backend_id(&self) -> &str {
+            BACKEND_ID
+        }
+
+        fn effective_key(&self, config: &Value) -> Result<EffectiveConfigKey, BackendError> {
+            let cfg = Self::parse(config)?;
+            let key = format!(
+                "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+                cfg.database_url.expose_secret(),
+                cfg.responses_table,
+                cfg.conversations_table,
+                cfg.items_table.as_deref().unwrap_or(""),
+                cfg.ssl_mode,
+                cfg.ssl_root_cert.as_ref().map_or("", |_| "set"),
+                super::pool_fingerprint(cfg.pool.as_ref()),
+            );
+            Ok(EffectiveConfigKey::new(key))
+        }
+
+        async fn build(&self, config: &Value) -> Result<ProvisionedBackend, BackendError> {
+            let cfg = Self::parse(config)?;
+            let url = cfg.database_url.expose_secret();
+            // Re-validate the host on every attempt (guards DNS rebinding). A
+            // private or invalid host is a permanent config error.
+            postgres_url::revalidate_postgres_host(BACKEND_ID, url, cfg.allow_private_database_url)
+                .map_err(|e| BackendError::Config(e.to_string()))?;
+            // Own the root cert so the borrowed PgTlsConfig outlives the build.
+            let root_cert = cfg.ssl_root_cert.as_ref().map(|s| s.expose_secret().to_owned());
+            let tls = PgTlsConfig {
+                require_certificate_authentication: false,
+                ssl_client_cert: None,
+                ssl_client_key: None,
+                ssl_mode: cfg.ssl_mode,
+                ssl_root_cert: root_cert.as_deref(),
+            };
+            // A Postgres connect failure is transient: the cache retries within
+            // budget before treating it as unavailable.
+            let store = Box::pin(PostgresResponseStore::new(
+                url,
+                &cfg.responses_table,
+                &cfg.conversations_table,
+                cfg.items_table.as_deref(),
+                &tls,
+                cfg.pool.as_ref(),
+            ))
+            .await
+            .map_err(|e| transient(url, &e.to_string()))?;
+
+            let store = Arc::new(store);
+            Ok(ProvisionedBackend {
+                retire: Arc::new(PostgresRetire {
+                    store: Arc::clone(&store),
+                }),
+                backend: store,
+            })
+        }
     }
 }
 
