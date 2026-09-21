@@ -60,11 +60,6 @@ fn pool_fingerprint(pool: Option<&crate::store::PoolConfig>) -> String {
 
 /// SQLite-backed store-backend factory.
 #[cfg(feature = "store-sqlite")]
-#[expect(clippy::allow_attributes, reason = "the factory awaits binary-injection wiring")]
-#[allow(
-    dead_code,
-    reason = "injected by binaries in the deferred server-wiring slice (#1259 slice 5)"
-)]
 mod sqlite {
     use std::sync::Arc;
 
@@ -168,11 +163,6 @@ mod sqlite {
 
 /// Postgres-backed store-backend factory.
 #[cfg(feature = "store-postgres")]
-#[expect(clippy::allow_attributes, reason = "the factory awaits binary-injection wiring")]
-#[allow(
-    dead_code,
-    reason = "injected by binaries in the deferred server-wiring slice (#1259 slice 5)"
-)]
 mod postgres {
     use std::sync::Arc;
 
@@ -210,6 +200,15 @@ mod postgres {
         /// Optional PEM CA the server certificate is verified against.
         #[serde(default)]
         ssl_root_cert: Option<SecretString>,
+        /// Optional PEM client certificate for mutual TLS.
+        #[serde(default)]
+        ssl_client_cert: Option<SecretString>,
+        /// Optional PEM client key paired with `ssl_client_cert`.
+        #[serde(default)]
+        ssl_client_key: Option<SecretString>,
+        /// Enforce the certificate-authentication compliance profile.
+        #[serde(default)]
+        require_certificate_authentication: bool,
         /// Permit a private/loopback database host (opt-in).
         #[serde(default)]
         allow_private_database_url: bool,
@@ -236,6 +235,36 @@ mod postgres {
         fn parse(config: &Value) -> Result<PostgresConfig, BackendError> {
             serde_json::from_value(config.clone()).map_err(|e| BackendError::Config(e.to_string()))
         }
+
+        /// Open and validate the pool. A connect failure is transient so the
+        /// cache retries within budget. A bad host is a permanent config error.
+        async fn connect(cfg: &PostgresConfig) -> Result<PostgresResponseStore, BackendError> {
+            let url = cfg.database_url.expose_secret();
+            // Re-validate the host on every attempt (guards DNS rebinding).
+            postgres_url::revalidate_postgres_host(BACKEND_ID, url, cfg.allow_private_database_url)
+                .map_err(|e| BackendError::Config(e.to_string()))?;
+            // Own the PEM material so the borrowed PgTlsConfig outlives the build.
+            let root_cert = cfg.ssl_root_cert.as_ref().map(|s| s.expose_secret().to_owned());
+            let client_cert = cfg.ssl_client_cert.as_ref().map(|s| s.expose_secret().to_owned());
+            let client_key = cfg.ssl_client_key.as_ref().map(|s| s.expose_secret().to_owned());
+            let tls = PgTlsConfig {
+                require_certificate_authentication: cfg.require_certificate_authentication,
+                ssl_client_cert: client_cert.as_deref(),
+                ssl_client_key: client_key.as_deref(),
+                ssl_mode: cfg.ssl_mode,
+                ssl_root_cert: root_cert.as_deref(),
+            };
+            Box::pin(PostgresResponseStore::new(
+                url,
+                &cfg.responses_table,
+                &cfg.conversations_table,
+                cfg.items_table.as_deref(),
+                &tls,
+                cfg.pool.as_ref(),
+            ))
+            .await
+            .map_err(|e| transient(url, &e.to_string()))
+        }
     }
 
     #[async_trait]
@@ -247,13 +276,16 @@ mod postgres {
         fn effective_key(&self, config: &Value) -> Result<EffectiveConfigKey, BackendError> {
             let cfg = Self::parse(config)?;
             let key = format!(
-                "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}",
+                "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 cfg.database_url.expose_secret(),
                 cfg.responses_table,
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
                 cfg.ssl_mode,
                 cfg.ssl_root_cert.as_ref().map_or("", |_| "set"),
+                cfg.ssl_client_cert.as_ref().map_or("", |_| "set"),
+                cfg.ssl_client_key.as_ref().map_or("", |_| "set"),
+                cfg.require_certificate_authentication,
                 super::pool_fingerprint(cfg.pool.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
@@ -261,34 +293,7 @@ mod postgres {
 
         async fn build(&self, config: &Value) -> Result<ProvisionedBackend, BackendError> {
             let cfg = Self::parse(config)?;
-            let url = cfg.database_url.expose_secret();
-            // Re-validate the host on every attempt (guards DNS rebinding). A
-            // private or invalid host is a permanent config error.
-            postgres_url::revalidate_postgres_host(BACKEND_ID, url, cfg.allow_private_database_url)
-                .map_err(|e| BackendError::Config(e.to_string()))?;
-            // Own the root cert so the borrowed PgTlsConfig outlives the build.
-            let root_cert = cfg.ssl_root_cert.as_ref().map(|s| s.expose_secret().to_owned());
-            let tls = PgTlsConfig {
-                require_certificate_authentication: false,
-                ssl_client_cert: None,
-                ssl_client_key: None,
-                ssl_mode: cfg.ssl_mode,
-                ssl_root_cert: root_cert.as_deref(),
-            };
-            // A Postgres connect failure is transient: the cache retries within
-            // budget before treating it as unavailable.
-            let store = Box::pin(PostgresResponseStore::new(
-                url,
-                &cfg.responses_table,
-                &cfg.conversations_table,
-                cfg.items_table.as_deref(),
-                &tls,
-                cfg.pool.as_ref(),
-            ))
-            .await
-            .map_err(|e| transient(url, &e.to_string()))?;
-
-            let store = Arc::new(store);
+            let store = Arc::new(Self::connect(&cfg).await?);
             Ok(ProvisionedBackend {
                 retire: Arc::new(PostgresRetire {
                     store: Arc::clone(&store),
@@ -297,6 +302,20 @@ mod postgres {
             })
         }
     }
+}
+
+/// The concrete store-backend factories compiled into this build, for a binary
+/// to inject into the lifecycle cache. Empty when no backend feature is set.
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[must_use]
+#[expect(clippy::vec_init_then_push, reason = "each push is feature-gated")]
+pub fn store_backend_factories() -> Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> {
+    let mut factories: Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> = Vec::new();
+    #[cfg(feature = "store-sqlite")]
+    factories.push(std::sync::Arc::new(sqlite::SqliteBackendFactory));
+    #[cfg(feature = "store-postgres")]
+    factories.push(std::sync::Arc::new(postgres::PostgresBackendFactory));
+    factories
 }
 
 #[cfg(test)]
@@ -434,5 +453,55 @@ mod tests {
             "same registry",
         );
         provisioned.lease.release().await;
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "store-postgres")]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, reason = "tests")]
+mod postgres_tests {
+    use praxis_ai_store::StoreBackendFactory as _;
+    use serde_json::json;
+
+    use super::postgres::PostgresBackendFactory;
+
+    /// A client-cert mTLS config the response-store filter accepts must also
+    /// pass factory validation: the factory models the same TLS fields.
+    #[test]
+    fn validate_accepts_client_cert_mtls_config() {
+        let cfg = json!({
+            "database_url": "postgres://svc@db.example.com:5432/app",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+            "ssl_mode": "verify-full",
+            "ssl_root_cert": "-----BEGIN CERTIFICATE-----\nroot\n-----END CERTIFICATE-----",
+            "ssl_client_cert": "-----BEGIN CERTIFICATE-----\nclient\n-----END CERTIFICATE-----",
+            "ssl_client_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+            "require_certificate_authentication": true,
+        });
+        PostgresBackendFactory
+            .validate_config(&cfg)
+            .expect("a client-cert config the filter accepts must validate");
+    }
+
+    /// Certificate authentication changes the connection identity, so it must
+    /// change the dedup key.
+    #[test]
+    fn cert_authentication_changes_the_effective_key() {
+        let base = json!({
+            "database_url": "postgres://svc@db.example.com:5432/app",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let mut with_cert = base.clone();
+        with_cert
+            .as_object_mut()
+            .expect("object")
+            .insert("require_certificate_authentication".to_owned(), json!(true));
+
+        let k1 = PostgresBackendFactory.effective_key(&base).expect("base key");
+        let k2 = PostgresBackendFactory.effective_key(&with_cert).expect("cert-auth key");
+        assert_ne!(k1, k2, "certificate authentication must change the dedup key");
     }
 }
