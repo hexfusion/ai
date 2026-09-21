@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use praxis_ai_apis::store::ResponseStoreRegistry;
 use praxis_core::config::{ChainRef, Config, FailureMode, FilterEntry, InsecureOptions, Listener};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use praxis_protocol::ListenerPipelines;
@@ -33,6 +34,37 @@ pub fn resolve_pipelines(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
+    resolve_pipelines_with_stores(
+        config,
+        registry,
+        health_registry,
+        kv_stores,
+        subrequest_client,
+        &HashMap::new(),
+    )
+}
+
+/// Like [`resolve_pipelines`], but attaches a caller-provided
+/// [`ResponseStoreRegistry`] per listener. The async serve and reload paths
+/// provision backends first and pass the populated registries here; a listener
+/// without a provided registry gets an empty one, which is the behaviour the
+/// validation, CLI, and test paths rely on.
+///
+/// # Errors
+///
+/// Same as [`resolve_pipelines`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, registries, shared services, and per-listener stores"
+)]
+pub(crate) fn resolve_pipelines_with_stores(
+    config: &Config,
+    registry: &FilterRegistry,
+    health_registry: &praxis_core::health::HealthRegistry,
+    kv_stores: &praxis_core::kv::KvStoreRegistry,
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    store_registries: &HashMap<String, ResponseStoreRegistry>,
+) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
 
     let chains: HashMap<&str, &[_]> = config
@@ -55,7 +87,14 @@ pub fn resolve_pipelines(
 
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
-        configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
+        configure_pipeline(
+            &mut pipeline,
+            config,
+            health_registry,
+            kv_stores,
+            subrequest_client,
+            store_registries.get(&listener.name).cloned().unwrap_or_default(),
+        )?;
 
         validate_provider_boundary(listener, &entries, &chains)?;
         validate_pipeline(&pipeline, &entries, &listener.name, &config.insecure_options)?;
@@ -66,14 +105,19 @@ pub fn resolve_pipelines(
     Ok(ListenerPipelines::new(pipelines))
 }
 
-/// Apply body limits, health registry, KV stores, and insecure options to a
-/// pipeline.
+/// Apply body limits, health registry, KV stores, insecure options, and the
+/// provided store registry to a pipeline.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads config, shared services, and the listener's store registry"
+)]
 fn configure_pipeline(
     pipeline: &mut FilterPipeline,
     config: &Config,
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    store_registry: ResponseStoreRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pipeline.apply_body_limits(
         config.body_limits.max_request_bytes,
@@ -87,6 +131,7 @@ fn configure_pipeline(
         pipeline.set_kv_stores(kv_stores.clone());
     }
     crate::install_pipeline_extensions(pipeline);
+    pipeline.add_pipeline_extension(Box::new(store_registry));
     pipeline.set_subrequest_client(subrequest_client.clone());
     // Propagate the private-upstream override into the pipeline and its nested
     // callout chains (e.g. `openai_file_resolve`'s and the MCP callouts'
