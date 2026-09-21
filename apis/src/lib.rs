@@ -35,8 +35,9 @@ pub mod vertex;
 pub(crate) mod web_search;
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
-pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
+pub use state_owner::{StateOwnerFilter, project_state_owner};
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
