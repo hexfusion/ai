@@ -32,6 +32,7 @@ mod postgres;
 mod postgres_tls;
 #[cfg(feature = "store-postgres")]
 pub(crate) mod postgres_url;
+mod provisioning;
 #[cfg_attr(
     not(any(feature = "store-postgres", feature = "store-sqlite")),
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),

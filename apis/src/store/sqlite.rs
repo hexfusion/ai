@@ -115,6 +115,14 @@ impl SqliteResponseStore {
         })
     }
 
+    /// Close the connection pool, releasing its connections.
+    ///
+    /// Called when the backend is retired from the process-wide cache so a
+    /// reload does not leak pools.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Insert or update a conversation row shared by both store traits.
     async fn upsert_conversation_record(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
