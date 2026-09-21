@@ -185,15 +185,27 @@ mod tests {
         ] {
             assert!(is_cloud_metadata(&ip(s)), "{s} should be cloud metadata");
             assert!(is_non_public_ip(&ip(s)), "{s} should be non-public");
-            assert!(is_file_url_ssrf_blocked(&ip(s), true), "{s} blocked even when private allowed");
+            assert!(
+                is_file_url_ssrf_blocked(&ip(s), true),
+                "{s} blocked even when private allowed"
+            );
         }
     }
 
     #[test]
     fn private_and_loopback_ranges_are_non_public() {
         for s in [
-            "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.0.0.0", "::1",
-            "fe80::1", "fec0::1", "fc00::1",
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fec0::1",
+            "fc00::1",
         ] {
             assert!(is_non_public_ip(&ip(s)), "{s} should be non-public");
         }
@@ -235,8 +247,17 @@ mod tests {
     #[test]
     fn special_use_ranges_are_non_public() {
         for s in [
-            "198.18.0.1", "192.0.0.1", "192.88.99.1", "192.0.2.1", "198.51.100.1", "203.0.113.1", "240.0.0.1",
-            "2001:db8::1", "2002:c0a8:1::1", "3fff::1", "5f00::1",
+            "198.18.0.1",
+            "192.0.0.1",
+            "192.88.99.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "2002:c0a8:1::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(is_non_public_ip(&ip(s)), "{s} should be non-public special-use");
         }

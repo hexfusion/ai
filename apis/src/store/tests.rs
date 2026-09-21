@@ -3317,7 +3317,7 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
-    use super::postgres::to_pg_ssl_mode;
+    use super::to_pg_ssl_mode;
 
     assert!(
         matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),

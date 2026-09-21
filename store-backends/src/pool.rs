@@ -49,12 +49,12 @@ mod tests {
     // "see the source", so a future bump could change it silently and
     // re-open the issue this validation closes. Pin it here, using
     // whichever driver is compiled (both share the generic default).
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[test]
     fn default_max_connections_matches_sqlx_default() {
-        #[cfg(feature = "store-postgres")]
+        #[cfg(feature = "postgres")]
         let sqlx_default = sqlx::postgres::PgPoolOptions::new().get_max_connections();
-        #[cfg(all(feature = "store-sqlite", not(feature = "store-postgres")))]
+        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
         let sqlx_default = sqlx::sqlite::SqlitePoolOptions::new().get_max_connections();
         assert_eq!(
             sqlx_default, DEFAULT_MAX_CONNECTIONS,

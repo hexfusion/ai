@@ -8,42 +8,11 @@
 //! here at their original paths. This module keeps the SQL backends and the
 //! transport-bound registry wrapper.
 
-#[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
-    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
-    allow(
-        dead_code,
-        reason = "codec helpers are unused until a SQL backend feature is enabled"
-    )
-)]
-mod compression;
-#[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
-    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
-    allow(
-        dead_code,
-        reason = "backend helpers are unused until a SQL backend feature is enabled"
-    )
-)]
-mod pool;
-#[cfg(feature = "store-postgres")]
-mod postgres;
-#[cfg(feature = "store-postgres")]
-mod postgres_tls;
-#[cfg(feature = "store-postgres")]
-pub(crate) mod postgres_url;
-mod provisioning;
-#[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
-    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
-    allow(
-        dead_code,
-        reason = "backend helpers are unused until a SQL backend feature is enabled"
-    )
-)]
-mod schemas;
-#[cfg(feature = "store-sqlite")]
-mod sqlite;
+// The SQL backends moved to the praxis-ai-store-backends crate (#1260). They are
+// re-exported below at their original `crate::store::*` paths so the
+// conversations and responses filters keep compiling unchanged. The transitional
+// dependency on praxis-ai-store-backends is removed once #1259b and #1262 take
+// those filters off concrete-store construction.
 
 #[cfg(test)]
 #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
@@ -61,6 +30,9 @@ mod tests;
 use std::sync::Arc;
 
 use praxis_ai_store::StoreRegistry;
+// Pool tuning, TLS mode, and compression config live in the SQL-free contract
+// crate, re-exported here at their old paths.
+pub use praxis_ai_store::{CompressionAlgorithm, PoolConfig, SslMode, StoreCompressionConfig};
 // The persistence contracts moved to praxis-ai-store; re-exported at their old
 // paths so existing `crate::store::*` references keep compiling. OwnerScopedStore
 // keeps its former name here.
@@ -68,46 +40,22 @@ pub use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, OwnerScopedStore as OwnerScopedResponseStore,
     PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, StoreError,
 };
-// Table-name validation, pool tuning, and TLS mode live in the SQL-free
-// contract crate, re-exported here at their old paths.
-pub use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
-#[cfg(feature = "store-postgres")]
-pub(crate) use schemas::validate_postgres_table_identifiers;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
-pub(crate) use schemas::validate_postgres_table_set_identifiers;
-
-pub use self::compression::{CompressionAlgorithm, StoreCompressionConfig};
-#[cfg(feature = "store-postgres")]
-pub use self::postgres::PostgresResponseStore;
-#[cfg(feature = "store-postgres")]
-pub use self::postgres::to_pg_ssl_mode;
-#[cfg(feature = "store-postgres")]
-pub use self::postgres_tls::PgTlsConfig;
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-pub use self::provisioning::store_backend_factories;
 #[cfg(feature = "store-sqlite")]
-pub use self::sqlite::SqliteResponseStore;
-use crate::StateOwner;
-
-/// Scrub a connection string, and any credentials embedded in it, from an error
-/// message before it reaches [`StoreError::Database`] or a log line.
-///
-/// The SQL backends carry their configured URL so a runtime query error redacts
-/// it here, matching the connect-time redaction the provisioning factories apply.
+pub use praxis_ai_store_backends::SqliteResponseStore;
+#[cfg(feature = "store-postgres")]
+pub(crate) use praxis_ai_store_backends::postgres_url;
 #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
-    let base = message.replace(url, "<redacted database url>");
-    // Best effort for a `scheme://user:pass@host` credential echoed separately
-    // from the full url: drop the userinfo segment. split_once avoids byte
-    // indexing, which could split a UTF-8 character.
-    let Some((before, rest)) = base.split_once("://") else {
-        return base;
-    };
-    match rest.split_once('@') {
-        Some((_userinfo, after_at)) => format!("{before}://<redacted credentials>@{after_at}"),
-        None => format!("{before}://{rest}"),
-    }
-}
+pub use praxis_ai_store_backends::store_backend_factories;
+#[cfg(feature = "store-postgres")]
+pub use praxis_ai_store_backends::to_pg_ssl_mode;
+#[cfg(feature = "store-postgres")]
+pub(crate) use praxis_ai_store_backends::validate_postgres_table_identifiers;
+#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+pub(crate) use praxis_ai_store_backends::validate_postgres_table_set_identifiers;
+#[cfg(feature = "store-postgres")]
+pub use praxis_ai_store_backends::{PgTlsConfig, PostgresResponseStore};
+
+use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // ResponseStoreRegistry
