@@ -10,27 +10,27 @@
 //! Postgres transient connect is retryable), compute the dedup key, and close
 //! the pool on retirement.
 
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use praxis_ai_store::BackendError;
 
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use super::redact_connection_error;
 
 /// A permanent build failure, redacted, as a backend-unavailable error.
-#[cfg(feature = "store-sqlite")]
+#[cfg(feature = "sqlite")]
 fn permanent(url: &str, message: &str) -> BackendError {
     BackendError::Unavailable(redact_connection_error(url, message))
 }
 
 /// A transient build failure, redacted, so provisioning retries within budget.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "postgres")]
 fn transient(url: &str, message: &str) -> BackendError {
     BackendError::Transient(redact_connection_error(url, message))
 }
 
 /// A stable fingerprint of the pool overrides for the dedup key.
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-fn pool_fingerprint(pool: Option<&crate::store::PoolConfig>) -> String {
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn pool_fingerprint(pool: Option<&crate::PoolConfig>) -> String {
     pool.map_or_else(
         || "default".to_owned(),
         |p| {
@@ -43,24 +43,26 @@ fn pool_fingerprint(pool: Option<&crate::store::PoolConfig>) -> String {
 }
 
 /// A stable fingerprint of the compression override for the dedup key.
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-fn compression_fingerprint(compression: Option<&crate::store::StoreCompressionConfig>) -> String {
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn compression_fingerprint(compression: Option<&praxis_ai_store::StoreCompressionConfig>) -> String {
     compression.map_or_else(|| "none".to_owned(), |c| format!("{:?}/{:?}", c.algorithm, c.level))
 }
 
 /// SQLite-backed store-backend factory.
-#[cfg(feature = "store-sqlite")]
+#[cfg(feature = "sqlite")]
 mod sqlite {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use praxis_ai_store::{EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
+    use praxis_ai_store::{
+        EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, StoreBackendFactory, StoreCompressionConfig,
+    };
     use secrecy::{ExposeSecret as _, SecretString};
     use serde::Deserialize;
     use serde_json::Value;
 
     use super::{BackendError, permanent};
-    use crate::store::{PoolConfig, SqliteResponseStore, StoreCompressionConfig};
+    use crate::SqliteResponseStore;
 
     /// Backend id the SQLite factory answers to.
     pub(crate) const BACKEND_ID: &str = "sqlite";
@@ -157,18 +159,21 @@ mod sqlite {
 }
 
 /// Postgres-backed store-backend factory.
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "postgres")]
 mod postgres {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use praxis_ai_store::{EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
+    use praxis_ai_store::{
+        EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, SslMode, StoreBackendFactory,
+        StoreCompressionConfig,
+    };
     use secrecy::{ExposeSecret as _, SecretString};
     use serde::Deserialize;
     use serde_json::Value;
 
     use super::{BackendError, transient};
-    use crate::store::{PgTlsConfig, PoolConfig, PostgresResponseStore, SslMode, StoreCompressionConfig, postgres_url};
+    use crate::{PgTlsConfig, PostgresResponseStore, postgres_url};
 
     /// Backend id the Postgres factory answers to.
     pub(crate) const BACKEND_ID: &str = "postgres";
@@ -343,20 +348,20 @@ mod postgres {
 
 /// The concrete store-backend factories compiled into this build, for a binary
 /// to inject into the lifecycle cache. Empty when no backend feature is set.
-#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 #[must_use]
 #[expect(clippy::vec_init_then_push, reason = "each push is feature-gated")]
 pub fn store_backend_factories() -> Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> {
     let mut factories: Vec<std::sync::Arc<dyn praxis_ai_store::StoreBackendFactory>> = Vec::new();
-    #[cfg(feature = "store-sqlite")]
+    #[cfg(feature = "sqlite")]
     factories.push(std::sync::Arc::new(sqlite::SqliteBackendFactory));
-    #[cfg(feature = "store-postgres")]
+    #[cfg(feature = "postgres")]
     factories.push(std::sync::Arc::new(postgres::PostgresBackendFactory));
     factories
 }
 
 #[cfg(test)]
-#[cfg(feature = "store-sqlite")]
+#[cfg(feature = "sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
@@ -492,7 +497,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "postgres")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "tests")]
 mod postgres_tests {

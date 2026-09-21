@@ -9,6 +9,8 @@
 //! semver promise.
 
 mod backend_config;
+#[cfg(feature = "compression")]
+pub mod compression;
 mod factory;
 mod owner;
 mod registry;
@@ -23,6 +25,8 @@ pub mod memory;
 pub mod contract_tests;
 
 pub use backend_config::{DEFAULT_MAX_CONNECTIONS, MAX_IDENTIFIER_LEN, PoolConfig, SslMode, validate_table_identifier};
+#[cfg(feature = "compression")]
+pub use compression::{CompressionAlgorithm, StoreCompressionConfig};
 pub use factory::{BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
