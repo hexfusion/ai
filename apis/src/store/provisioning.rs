@@ -18,7 +18,7 @@ use praxis_ai_store::BackendError;
 ///
 /// [`StoreError::Database`]: praxis_ai_store::StoreError::Database
 #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
+fn redact_connection_error(url: &str, message: &str) -> String {
     let base = message.replace(url, "<redacted database url>");
     // Best effort for a `scheme://user:pass@host` credential echoed separately
     // from the full url: drop the userinfo segment. split_once avoids byte
@@ -197,13 +197,13 @@ mod postgres {
         /// TLS verification mode.
         #[serde(default)]
         ssl_mode: Option<SslMode>,
-        /// Optional PEM CA the server certificate is verified against.
+        /// Path to a PEM CA the server certificate is verified against.
         #[serde(default)]
         ssl_root_cert: Option<SecretString>,
-        /// Optional PEM client certificate for mutual TLS.
+        /// Path to a PEM client certificate for mutual TLS.
         #[serde(default)]
         ssl_client_cert: Option<SecretString>,
-        /// Optional PEM client key paired with `ssl_client_cert`.
+        /// Path to the PEM client key paired with `ssl_client_cert`.
         #[serde(default)]
         ssl_client_key: Option<SecretString>,
         /// Enforce the certificate-authentication compliance profile.
@@ -230,6 +230,31 @@ mod postgres {
     /// Provisions Postgres-backed persisted-state stores.
     pub(crate) struct PostgresBackendFactory;
 
+    /// Owned certificate-path material a borrowed [`PgTlsConfig`] outlives.
+    type TlsPaths = (Option<String>, Option<String>, Option<String>);
+
+    impl PostgresConfig {
+        /// Own the cert-path material so a borrowed `PgTlsConfig` can reference it.
+        fn tls_paths(&self) -> TlsPaths {
+            (
+                self.ssl_root_cert.as_ref().map(|s| s.expose_secret().to_owned()),
+                self.ssl_client_cert.as_ref().map(|s| s.expose_secret().to_owned()),
+                self.ssl_client_key.as_ref().map(|s| s.expose_secret().to_owned()),
+            )
+        }
+
+        /// Borrow the owned paths as a `PgTlsConfig`.
+        fn tls_config<'a>(&self, paths: &'a TlsPaths) -> PgTlsConfig<'a> {
+            PgTlsConfig {
+                require_certificate_authentication: self.require_certificate_authentication,
+                ssl_client_cert: paths.1.as_deref(),
+                ssl_client_key: paths.2.as_deref(),
+                ssl_mode: self.ssl_mode,
+                ssl_root_cert: paths.0.as_deref(),
+            }
+        }
+    }
+
     impl PostgresBackendFactory {
         /// Parse the inline config, failing with a config error.
         fn parse(config: &Value) -> Result<PostgresConfig, BackendError> {
@@ -243,17 +268,11 @@ mod postgres {
             // Re-validate the host on every attempt (guards DNS rebinding).
             postgres_url::revalidate_postgres_host(BACKEND_ID, url, cfg.allow_private_database_url)
                 .map_err(|e| BackendError::Config(e.to_string()))?;
-            // Own the PEM material so the borrowed PgTlsConfig outlives the build.
-            let root_cert = cfg.ssl_root_cert.as_ref().map(|s| s.expose_secret().to_owned());
-            let client_cert = cfg.ssl_client_cert.as_ref().map(|s| s.expose_secret().to_owned());
-            let client_key = cfg.ssl_client_key.as_ref().map(|s| s.expose_secret().to_owned());
-            let tls = PgTlsConfig {
-                require_certificate_authentication: cfg.require_certificate_authentication,
-                ssl_client_cert: client_cert.as_deref(),
-                ssl_client_key: client_key.as_deref(),
-                ssl_mode: cfg.ssl_mode,
-                ssl_root_cert: root_cert.as_deref(),
-            };
+            let paths = cfg.tls_paths();
+            let tls = cfg.tls_config(&paths);
+            // Same fail-closed TLS/auth check the filter runs, before the pool opens.
+            tls.validate(BACKEND_ID, url)
+                .map_err(|e| BackendError::Config(e.to_string()))?;
             Box::pin(PostgresResponseStore::new(
                 url,
                 &cfg.responses_table,
@@ -275,6 +294,8 @@ mod postgres {
 
         fn effective_key(&self, config: &Value) -> Result<EffectiveConfigKey, BackendError> {
             let cfg = Self::parse(config)?;
+            // Key on the cert-path values, not mere presence: distinct trust
+            // anchors or client identities at different paths are distinct pools.
             let key = format!(
                 "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 cfg.database_url.expose_secret(),
@@ -282,13 +303,23 @@ mod postgres {
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
                 cfg.ssl_mode,
-                cfg.ssl_root_cert.as_ref().map_or("", |_| "set"),
-                cfg.ssl_client_cert.as_ref().map_or("", |_| "set"),
-                cfg.ssl_client_key.as_ref().map_or("", |_| "set"),
+                cfg.ssl_root_cert.as_ref().map_or("", |s| s.expose_secret()),
+                cfg.ssl_client_cert.as_ref().map_or("", |s| s.expose_secret()),
+                cfg.ssl_client_key.as_ref().map_or("", |s| s.expose_secret()),
                 cfg.require_certificate_authentication,
                 super::pool_fingerprint(cfg.pool.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
+        }
+
+        fn validate_config(&self, config: &Value) -> Result<(), BackendError> {
+            let cfg = Self::parse(config)?;
+            let url = cfg.database_url.expose_secret();
+            let paths = cfg.tls_paths();
+            let tls = cfg.tls_config(&paths);
+            // Run the filter's fail-closed TLS/auth check at pipeline construction.
+            tls.validate(BACKEND_ID, url)
+                .map_err(|e| BackendError::Config(e.to_string()))
         }
 
         async fn build(&self, config: &Value) -> Result<ProvisionedBackend, BackendError> {
@@ -325,7 +356,7 @@ pub fn store_backend_factories() -> Vec<std::sync::Arc<dyn praxis_ai_store::Stor
 mod tests {
     use std::sync::Arc;
 
-    use praxis_ai_store::{StoreBackendFactory, StoreCapability};
+    use praxis_ai_store::StoreBackendFactory;
     use praxis_ai_store_lifecycle::{BackendCache, ProvisionError, StoreRef};
     use serde_json::json;
     use tempfile::TempDir;
@@ -344,7 +375,6 @@ mod tests {
         StoreRef {
             name: Arc::from(name),
             backend_id: Arc::from("sqlite"),
-            capability: StoreCapability::ResponsesAndConversations,
             config: json!({
                 "database_url": url,
                 "responses_table": "responses",
@@ -411,7 +441,6 @@ mod tests {
         let bad = StoreRef {
             name: Arc::from("default"),
             backend_id: Arc::from("sqlite"),
-            capability: StoreCapability::Responses,
             config: json!({
                 "database_url": "sqlite:///nonexistent-dir/does-not-exist.db?mode=ro",
                 "responses_table": "responses",
@@ -467,7 +496,10 @@ mod postgres_tests {
     use super::postgres::PostgresBackendFactory;
 
     /// A client-cert mTLS config the response-store filter accepts must also
-    /// pass factory validation: the factory models the same TLS fields.
+    /// pass factory validation: the factory runs the same TLS check.
+    ///
+    /// `require_certificate_authentication` is left off so the compliance
+    /// profile's `PGPASSWORD`-env read does not make this env-dependent.
     #[test]
     fn validate_accepts_client_cert_mtls_config() {
         let cfg = json!({
@@ -475,14 +507,53 @@ mod postgres_tests {
             "responses_table": "responses",
             "conversations_table": "conversations",
             "ssl_mode": "verify-full",
-            "ssl_root_cert": "-----BEGIN CERTIFICATE-----\nroot\n-----END CERTIFICATE-----",
-            "ssl_client_cert": "-----BEGIN CERTIFICATE-----\nclient\n-----END CERTIFICATE-----",
-            "ssl_client_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
-            "require_certificate_authentication": true,
+            "ssl_root_cert": "/etc/pki/ca.pem",
+            "ssl_client_cert": "/etc/pki/client.pem",
+            "ssl_client_key": "/etc/pki/client.key",
         });
         PostgresBackendFactory
             .validate_config(&cfg)
             .expect("a client-cert config the filter accepts must validate");
+    }
+
+    /// A client cert under a non-verifying `ssl_mode` must be rejected, matching
+    /// the filter's fail-closed check: `require` encrypts but does not verify.
+    #[test]
+    fn validate_rejects_client_cert_with_unverified_ssl_mode() {
+        let cfg = json!({
+            "database_url": "postgres://svc@db.example.com:5432/app",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+            "ssl_mode": "require",
+            "ssl_client_cert": "/etc/pki/client.pem",
+            "ssl_client_key": "/etc/pki/client.key",
+        });
+        PostgresBackendFactory
+            .validate_config(&cfg)
+            .expect_err("a client cert under an unverified ssl_mode must be rejected");
+    }
+
+    /// A different client-certificate path is a different connection identity,
+    /// so it must change the dedup key rather than collide onto one pool.
+    #[test]
+    fn client_cert_path_changes_the_effective_key() {
+        let base = json!({
+            "database_url": "postgres://svc@db.example.com:5432/app",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+            "ssl_mode": "verify-full",
+            "ssl_client_cert": "/etc/pki/client-a.pem",
+            "ssl_client_key": "/etc/pki/client.key",
+        });
+        let mut other = base.clone();
+        other
+            .as_object_mut()
+            .expect("object")
+            .insert("ssl_client_cert".to_owned(), json!("/etc/pki/client-b.pem"));
+
+        let k1 = PostgresBackendFactory.effective_key(&base).expect("base key");
+        let k2 = PostgresBackendFactory.effective_key(&other).expect("other-cert key");
+        assert_ne!(k1, k2, "a different client-certificate path must change the dedup key");
     }
 
     /// Certificate authentication changes the connection identity, so it must
