@@ -3528,6 +3528,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -3674,6 +3675,17 @@ dependencies = [
  "async-trait",
  "dashmap",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "praxis-ai-store-lifecycle"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "praxis-ai-store",
  "serde_json",
  "tokio",
 ]
