@@ -13,6 +13,7 @@ mod registry;
 mod traits;
 mod types;
 
+#[cfg(feature = "test-support")]
 pub mod memory;
 
 #[cfg(feature = "test-support")]
