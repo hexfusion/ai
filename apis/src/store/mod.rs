@@ -83,6 +83,8 @@ pub use self::postgres::PostgresResponseStore;
 pub use self::postgres::to_pg_ssl_mode;
 #[cfg(feature = "store-postgres")]
 pub use self::postgres_tls::PgTlsConfig;
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+pub use self::provisioning::store_backend_factories;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
 use crate::StateOwner;
