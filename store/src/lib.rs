@@ -22,9 +22,7 @@ pub mod memory;
 pub mod contract_tests;
 
 pub use backend_config::{DEFAULT_MAX_CONNECTIONS, MAX_IDENTIFIER_LEN, PoolConfig, SslMode, validate_table_identifier};
-pub use factory::{
-    BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory, StoreCapability,
-};
+pub use factory::{BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};

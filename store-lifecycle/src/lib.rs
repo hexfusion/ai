@@ -18,21 +18,18 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry as MapEntry};
 use praxis_ai_store::{
     BackendError, EffectiveConfigKey, PersistedStateBackend, ProvisionedBackend, RetireBackend, StoreBackendFactory,
-    StoreCapability, StoreRegistry,
+    StoreRegistry,
 };
 use serde_json::Value;
 
-/// A store a pipeline requires: a registry name, the backend kind, the
-/// capability the caller depends on, and the inline configuration the factory
-/// interprets.
+/// A store a pipeline requires: a registry name, the backend kind, and the
+/// inline configuration the factory interprets.
 #[derive(Clone, Debug)]
 pub struct StoreRef {
     /// Registry key the transport layer resolves at request time.
     pub name: Arc<str>,
     /// Backend kind, routed to the factory with the matching id.
     pub backend_id: Arc<str>,
-    /// Capability the caller depends on.
-    pub capability: StoreCapability,
     /// Inline configuration passed verbatim to the factory.
     pub config: Value,
 }
@@ -334,7 +331,9 @@ impl BackendCache {
             match factory.build(config).await {
                 Ok(built) => return Ok(built),
                 Err(BackendError::Transient(_)) if attempt < self.retry.max_attempts => {
-                    // The factory's own connect timeout paces the retry.
+                    // Retry immediately: an immediate-failure mode (connection
+                    // refused) burns the budget fast, but max_attempts bounds it
+                    // and this runs once at provision, off any request path.
                 },
                 Err(BackendError::Transient(m)) => {
                     return Err(BackendError::Unavailable(format!(
@@ -478,11 +477,10 @@ mod tests {
         factory
     }
 
-    fn store_ref(name: &str, backend_id: &str, url: &str, capability: StoreCapability) -> StoreRef {
+    fn store_ref(name: &str, backend_id: &str, url: &str) -> StoreRef {
         StoreRef {
             name: Arc::from(name),
             backend_id: Arc::from(backend_id),
-            capability,
             config: json!({ "url": url }),
         }
     }
@@ -493,7 +491,7 @@ mod tests {
         let cache = BackendCache::new(vec![as_dyn(Arc::clone(&factory))]);
 
         let provisioned = cache
-            .provision(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
+            .provision(&[store_ref("default", "fake", "a")])
             .await
             .expect("initial load succeeds");
 
@@ -505,7 +503,7 @@ mod tests {
     async fn reload_reuses_unchanged_config_without_rebuild() {
         let factory = FakeFactory::new("fake", Behavior::Ok);
         let cache = BackendCache::new(vec![as_dyn(Arc::clone(&factory))]);
-        let refs = [store_ref("default", "fake", "a", StoreCapability::Responses)];
+        let refs = [store_ref("default", "fake", "a")];
 
         let gen1 = cache.provision(&refs).await.expect("gen1");
         let gen2 = cache.provision(&refs).await.expect("gen2 reuses");
@@ -524,7 +522,7 @@ mod tests {
     async fn last_release_retires_the_backend() {
         let factory = FakeFactory::new("fake", Behavior::Ok);
         let cache = BackendCache::new(vec![as_dyn(Arc::clone(&factory))]);
-        let refs = [store_ref("default", "fake", "a", StoreCapability::Responses)];
+        let refs = [store_ref("default", "fake", "a")];
 
         let gen1 = cache.provision(&refs).await.expect("gen1");
         let gen2 = cache.provision(&refs).await.expect("gen2");
@@ -541,11 +539,11 @@ mod tests {
         let cache = BackendCache::new(vec![as_dyn(Arc::clone(&factory))]);
 
         let gen1 = cache
-            .provision(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
+            .provision(&[store_ref("default", "fake", "a")])
             .await
             .expect("gen1 on url a");
         let gen2 = cache
-            .provision(&[store_ref("default", "fake", "b", StoreCapability::Responses)])
+            .provision(&[store_ref("default", "fake", "b")])
             .await
             .expect("gen2 on url b");
 
@@ -562,9 +560,7 @@ mod tests {
         let factory = FakeFactory::new("fake", Behavior::Unavailable);
         let cache = BackendCache::new(vec![factory]);
 
-        let result = cache
-            .provision(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
-            .await;
+        let result = cache.provision(&[store_ref("default", "fake", "a")]).await;
         let Err(err) = result else {
             panic!("expected a permanent-failure error")
         };
@@ -583,9 +579,7 @@ mod tests {
         let factory = FakeFactory::new("fake", Behavior::Ok);
         let cache = BackendCache::new(vec![factory]);
 
-        let result = cache
-            .provision(&[store_ref("default", "missing", "a", StoreCapability::Responses)])
-            .await;
+        let result = cache.provision(&[store_ref("default", "missing", "a")]).await;
         let Err(err) = result else {
             panic!("expected an unknown-backend error")
         };
@@ -599,7 +593,7 @@ mod tests {
         let cache = BackendCache::with_retry(vec![as_dyn(Arc::clone(&factory))], RetryPolicy { max_attempts: 3 });
 
         let provisioned = cache
-            .provision(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
+            .provision(&[store_ref("default", "fake", "a")])
             .await
             .expect("succeeds on the third attempt");
 
@@ -612,9 +606,7 @@ mod tests {
         let factory = FakeFactory::new("fake", Behavior::TransientThenOk(AtomicUsize::new(5)));
         let cache = BackendCache::with_retry(vec![factory], RetryPolicy { max_attempts: 3 });
 
-        let result = cache
-            .provision(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
-            .await;
+        let result = cache.provision(&[store_ref("default", "fake", "a")]).await;
         let Err(err) = result else {
             panic!("expected budget exhaustion")
         };
@@ -635,8 +627,8 @@ mod tests {
 
         let provisioned = cache
             .provision(&[
-                store_ref("responses", "fake", "a", StoreCapability::Responses),
-                store_ref("conversations", "fake", "a", StoreCapability::ResponsesAndConversations),
+                store_ref("responses", "fake", "a"),
+                store_ref("conversations", "fake", "a"),
             ])
             .await
             .expect("both references provision");
@@ -652,7 +644,7 @@ mod tests {
         let factory = FakeFactory::new("fake", Behavior::Ok);
         let cache = BackendCache::new(vec![as_dyn(factory)]);
         cache
-            .validate(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
+            .validate(&[store_ref("default", "fake", "a")])
             .expect("valid config passes construction-time validation");
     }
 
@@ -661,7 +653,7 @@ mod tests {
         let factory = FakeFactory::new("fake", Behavior::Ok);
         let cache = BackendCache::new(vec![as_dyn(factory)]);
         let err = cache
-            .validate(&[store_ref("default", "missing", "a", StoreCapability::Responses)])
+            .validate(&[store_ref("default", "missing", "a")])
             .expect_err("unknown backend id fails validation");
         assert!(matches!(err, ProvisionError::UnknownBackend { .. }));
     }
@@ -674,7 +666,6 @@ mod tests {
         let bad = StoreRef {
             name: Arc::from("default"),
             backend_id: Arc::from("fake"),
-            capability: StoreCapability::Responses,
             config: json!({}),
         };
         let err = cache.validate(&[bad]).expect_err("malformed config fails validation");

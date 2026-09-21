@@ -14,26 +14,12 @@ use async_trait::async_trait;
 
 use crate::traits::PersistedStateBackend;
 
-/// Capability a filter requires from a resolved backend.
-///
-/// A resolved backend is always a combined [`PersistedStateBackend`], so both
-/// variants are satisfiable by construction; the descriptor records what a
-/// caller depends on so provisioning can reject a reference that names a
-/// backend it cannot serve.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StoreCapability {
-    /// Response persistence only.
-    Responses,
-    /// Response and conversation-item persistence.
-    ResponsesAndConversations,
-}
-
 /// Canonical dedup key for an effective backend configuration.
 ///
 /// Two references that produce an equal key share one backend and one pool. The
 /// factory computes it from the normalized connection-determining fields
-/// (backend id, database url, TLS mode and root cert, pool parameters). It must
-/// not embed secret material in a form that leaks through [`fmt::Debug`].
+/// (backend id, database url, TLS mode, certificate paths, pool parameters). It
+/// must not embed secret material in a form that leaks through [`fmt::Debug`].
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct EffectiveConfigKey(Arc<str>);
 
