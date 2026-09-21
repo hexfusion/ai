@@ -14,6 +14,7 @@ mod owner;
 mod registry;
 mod traits;
 mod types;
+pub mod url_security;
 
 #[cfg(feature = "test-support")]
 pub mod memory;

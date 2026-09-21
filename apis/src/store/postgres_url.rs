@@ -17,7 +17,7 @@ use std::{
 use percent_encoding::percent_decode_str;
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 
-use crate::openai::url_security::is_non_public_ip;
+use praxis_ai_store::url_security::is_non_public_ip;
 
 // -----------------------------------------------------------------------------
 // Public API
