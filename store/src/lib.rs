@@ -18,7 +18,7 @@ pub mod memory;
 #[cfg(feature = "test-support")]
 pub mod contract_tests;
 
-pub use owner::{StateOwner, StateOwnerError};
+pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
