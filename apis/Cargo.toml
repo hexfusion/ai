@@ -53,6 +53,7 @@ jsonschema = { workspace = true, optional = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
+praxis-ai-store = { workspace = true }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,
 # web_search, file_search, MCP callouts). chain-binding: ChainBindingContext /
@@ -79,6 +80,7 @@ zstd = { workspace = true, optional = true }
 [dev-dependencies]
 allocation-counter = { workspace = true }
 axum = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 tempfile = { workspace = true }

@@ -3,7 +3,7 @@
 
 //! SQL schema generation for the response store.
 
-use super::types::StoreError;
+use super::StoreError;
 
 // -----------------------------------------------------------------------------
 // Table Names
