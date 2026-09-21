@@ -99,7 +99,16 @@ impl fmt::Display for StateOwnerError {
 impl std::error::Error for StateOwnerError {}
 
 /// Validate one bounded, nonempty owner component.
-fn validate_component(component: &'static str, value: &str) -> Result<(), StateOwnerError> {
+///
+/// Exposed so the transport layer can validate an individual owner component
+/// (tenant, issuer, or subject) as it parses trusted headers, before it has all
+/// three to call [`StateOwner::from_trusted_parts`].
+///
+/// # Errors
+///
+/// Returns [`StateOwnerError`] when the value is empty, oversized, or contains a
+/// control character.
+pub fn validate_component(component: &'static str, value: &str) -> Result<(), StateOwnerError> {
     if value.is_empty() || value.len() > MAX_COMPONENT_BYTES || value.chars().any(char::is_control) {
         return Err(StateOwnerError { component });
     }

@@ -91,6 +91,20 @@ async fn responses_are_owner_scoped(backend: &dyn PersistedStateBackend) {
 #[expect(clippy::too_many_lines, reason = "linear contract assertions")]
 async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
     let o = owner("appr");
+    // Approvals belong to a persisted response; write the parent first so a
+    // backend with a foreign key from approvals to responses accepts them.
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_appr".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert response for approvals");
     let approvals = [approval("a1"), approval("a2")];
     backend
         .record_pending_approvals(&o, "resp_appr", &approvals, 10)
