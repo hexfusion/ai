@@ -196,6 +196,40 @@ impl BackendCache {
         })
     }
 
+    /// Validate every store reference's configuration without building a pool or
+    /// touching a runtime, so a malformed or unknown-backend config fails at
+    /// pipeline construction rather than at first traffic.
+    ///
+    /// Pool creation stays lazy on the serving runtime: sqlx pools bind to the
+    /// runtime that opens them, and the server owns that runtime, which is not
+    /// reachable at synchronous pipeline construction. "Eager" is therefore
+    /// eager config validation here; a well-configured but unreachable backend
+    /// surfaces at first touch, not silently per request.
+    ///
+    /// # Errors
+    ///
+    /// [`ProvisionError::UnknownBackend`] for a reference whose backend id has no
+    /// injected factory, or [`ProvisionError::Backend`] when a factory rejects
+    /// the configuration.
+    pub fn validate(&self, refs: &[StoreRef]) -> Result<(), ProvisionError> {
+        for r in refs {
+            let factory = self
+                .factories
+                .get(&r.backend_id)
+                .ok_or_else(|| ProvisionError::UnknownBackend {
+                    name: Arc::clone(&r.name),
+                    backend_id: Arc::clone(&r.backend_id),
+                })?;
+            factory
+                .validate_config(&r.config)
+                .map_err(|source| ProvisionError::Backend {
+                    name: Arc::clone(&r.name),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     /// Resolve one reference to a backend, reusing a cached entry or building.
     async fn resolve(
         &self,
@@ -611,5 +645,47 @@ mod tests {
         assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
         assert!(provisioned.registry.contains("responses"));
         assert!(provisioned.registry.contains("conversations"));
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_config() {
+        let factory = FakeFactory::new("fake", Behavior::Ok);
+        let cache = BackendCache::new(vec![as_dyn(factory)]);
+        cache
+            .validate(&[store_ref("default", "fake", "a", StoreCapability::Responses)])
+            .expect("valid config passes construction-time validation");
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_backend() {
+        let factory = FakeFactory::new("fake", Behavior::Ok);
+        let cache = BackendCache::new(vec![as_dyn(factory)]);
+        let err = cache
+            .validate(&[store_ref("default", "missing", "a", StoreCapability::Responses)])
+            .expect_err("unknown backend id fails validation");
+        assert!(matches!(err, ProvisionError::UnknownBackend { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_config_without_building() {
+        let factory = FakeFactory::new("fake", Behavior::Ok);
+        let cache = BackendCache::new(vec![as_dyn(Arc::clone(&factory))]);
+        // Missing the "url" field the fake factory's key requires.
+        let bad = StoreRef {
+            name: Arc::from("default"),
+            backend_id: Arc::from("fake"),
+            capability: StoreCapability::Responses,
+            config: json!({}),
+        };
+        let err = cache.validate(&[bad]).expect_err("malformed config fails validation");
+        assert!(matches!(
+            err,
+            ProvisionError::Backend {
+                source: BackendError::Config(_),
+                ..
+            }
+        ));
+        // Validation performs no I/O: nothing is built.
+        assert_eq!(factory.builds.load(Ordering::SeqCst), 0);
     }
 }

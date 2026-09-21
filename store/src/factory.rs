@@ -116,6 +116,18 @@ pub trait StoreBackendFactory: Send + Sync {
     /// Returns [`BackendError::Config`] when the configuration is malformed.
     fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError>;
 
+    /// Validate configuration without I/O, so a malformed config fails at
+    /// pipeline construction rather than at first traffic. The default checks
+    /// the config parses well enough to compute the dedup key; a factory may
+    /// override to validate more. Connectivity is not checked here (no runtime).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Config`] when the configuration is malformed.
+    fn validate_config(&self, config: &serde_json::Value) -> Result<(), BackendError> {
+        self.effective_key(config).map(|_| ())
+    }
+
     /// Build and eagerly validate a backend: open the pool and verify the
     /// schema, so an unusable backend fails here rather than on first traffic.
     ///
