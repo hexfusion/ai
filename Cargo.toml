@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "store",
+    "store-lifecycle",
     "server",
     "server/build_support",
     "filters",
