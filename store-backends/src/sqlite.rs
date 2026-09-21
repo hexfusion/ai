@@ -4,6 +4,7 @@
 //! [`SqliteResponseStore`] — `SQLite` backend for the response store.
 
 use async_trait::async_trait;
+use praxis_ai_store::StateOwner;
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -21,7 +22,6 @@ use super::{
         sqlite_key_column_folding,
     },
 };
-use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // SqliteResponseStore

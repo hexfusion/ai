@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use praxis_ai_store::StateOwner;
 use sqlx::{
     AssertSqlSafe, Row as _,
     postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode},
@@ -24,7 +25,6 @@ use super::{
         schema_version_table, validate_postgres_identifiers,
     },
 };
-use crate::StateOwner;
 
 /// Map the SQL-free [`SslMode`] onto sqlx's [`PgSslMode`].
 ///

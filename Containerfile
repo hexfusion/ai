@@ -33,6 +33,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY store/Cargo.toml ./store/Cargo.toml
 COPY store-lifecycle/Cargo.toml ./store-lifecycle/Cargo.toml
+COPY store-backends/Cargo.toml ./store-backends/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
@@ -81,6 +82,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # copied again here.
 COPY store/src ./store/src
 COPY store-lifecycle/src ./store-lifecycle/src
+COPY store-backends/src ./store-backends/src
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src

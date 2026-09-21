@@ -3518,7 +3518,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "praxis-ai-store",
- "praxis-ai-store-lifecycle",
+ "praxis-ai-store-backends",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -3540,7 +3540,6 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
- "zstd 0.14.0",
 ]
 
 [[package]]
@@ -3673,6 +3672,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "yaml_serde",
+ "zstd 0.14.0",
+]
+
+[[package]]
+name = "praxis-ai-store-backends"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "percent-encoding",
+ "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
+ "praxis-proxy-filter",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "yaml_serde",
 ]
 
 [[package]]

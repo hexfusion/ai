@@ -82,6 +82,7 @@ FROM toolchain AS builder
 COPY Cargo.toml Cargo.lock LICENSE NOTICE ./
 COPY store store
 COPY store-lifecycle store-lifecycle
+COPY store-backends store-backends
 COPY apis apis
 COPY filters filters
 COPY server server

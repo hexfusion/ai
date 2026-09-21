@@ -299,7 +299,7 @@ coverage-check:
 	PRAXIS_AI_BIN=$(abspath target/llvm-cov-target/debug/praxis-ai) \
 	cargo llvm-cov --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) --json \
 		--exclude xtask \
-		--ignore-filename-regex '(target/|tests/|store/postgres\.rs)' \
+		--ignore-filename-regex '(target/|tests/|store-backends/src/postgres\.rs)' \
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \
