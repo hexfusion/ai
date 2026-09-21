@@ -1119,7 +1119,7 @@ impl crate::store::ResponseStore for RecordingResponseStore {
 /// Install a [`RecordingResponseStore`] before the request phase so
 /// `get_or_init_store` keeps it instead of building a real backend.
 fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<RecordingResponseStore>) {
-    let dyn_store: std::sync::Arc<dyn crate::store::ResponseStore> = store;
+    let dyn_store: std::sync::Arc<dyn crate::store::PersistedStateBackend> = store;
     assert!(
         filter.store.set(Some(dyn_store)).is_ok(),
         "store OnceCell should be empty before the request phase"
@@ -6268,4 +6268,170 @@ conversations_table: openai_conversations
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
     );
+}
+
+/// The response-store filter only exercises the response half, so this recording
+/// double leaves the conversation-item surface unsupported.
+#[async_trait::async_trait]
+impl crate::store::ConversationItemStore for RecordingResponseStore {
+    async fn upsert_conversation(
+        &self,
+        _record: &crate::store::ConversationRecord,
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &serde_json::Value,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(
+        &self,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<i64, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
 }

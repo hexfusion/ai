@@ -11,8 +11,8 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationRecord, PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-        SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
+        ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
 };
 
@@ -3570,4 +3570,156 @@ fn cleanup_sqlite_file(db_path: &std::path::Path) {
     drop(std::fs::remove_file(db_path));
     drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
+}
+
+/// The rehydrate registry facade uses only the response half, so this test
+/// double leaves the conversation-item surface unsupported.
+#[async_trait::async_trait]
+impl ConversationItemStore for MockStore {
+    async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _metadata: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &Value,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<i64, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
 }

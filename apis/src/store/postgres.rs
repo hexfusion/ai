@@ -13,7 +13,8 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    SslMode,
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
+    ResponseStore, SslMode, StoreError,
     compression::{StoreCompressionConfig, decode, run_blocking},
     pool::{PoolConfig, apply_pool_config},
     postgres_tls::PgTlsConfig,
@@ -22,8 +23,6 @@ use super::{
         check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
         schema_version_table, validate_postgres_identifiers,
     },
-    trait_def::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
 use crate::StateOwner;
 

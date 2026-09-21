@@ -78,7 +78,7 @@ use crate::{
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     state_owner::{StateOwner, require_state_owner},
-    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, StoreError},
+    store::{PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -99,7 +99,7 @@ pub struct ResponseStoreFilter {
 
     /// Lazily initialized store backend. SQLite init failures are cached
     /// as `None`; Postgres init failures are retried on every code path.
-    pub(crate) store: OnceCell<Option<Arc<dyn ResponseStore>>>,
+    pub(crate) store: OnceCell<Option<Arc<dyn PersistedStateBackend>>>,
 }
 
 impl ResponseStoreFilter {
@@ -128,7 +128,7 @@ impl ResponseStoreFilter {
         not(any(feature = "store-postgres", feature = "store-sqlite")),
         expect(clippy::unused_async, reason = "only the SQL backends await during construction")
     )]
-    pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
+    pub(super) async fn build_store(&self) -> Result<Arc<dyn PersistedStateBackend>, StoreError> {
         match self.config.backend {
             #[cfg(feature = "store-sqlite")]
             StorageBackend::Sqlite => {
@@ -142,7 +142,7 @@ impl ResponseStoreFilter {
                 )
                 .await;
                 store.map(|s| {
-                    let arc: Arc<dyn ResponseStore> = Arc::new(s);
+                    let arc: Arc<dyn PersistedStateBackend> = Arc::new(s);
                     arc
                 })
             },
@@ -167,7 +167,7 @@ impl ResponseStoreFilter {
                 ))
                 .await;
                 store.map(|s| {
-                    let arc: Arc<dyn ResponseStore> = Arc::new(s);
+                    let arc: Arc<dyn PersistedStateBackend> = Arc::new(s);
                     arc
                 })
             },
@@ -179,7 +179,7 @@ impl ResponseStoreFilter {
     }
 
     /// Build the store and log successful initialization.
-    async fn build_logged_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
+    async fn build_logged_store(&self) -> Result<Arc<dyn PersistedStateBackend>, StoreError> {
         let store = Box::pin(self.build_store()).await?;
         debug!(
             backend = ?self.config.backend,
@@ -191,7 +191,7 @@ impl ResponseStoreFilter {
     }
 
     /// Initialize a store once, caching failed init permanently.
-    async fn init_permanent_store(&self) -> Option<Arc<dyn ResponseStore>> {
+    async fn init_permanent_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
         match Box::pin(self.build_logged_store()).await {
             Ok(store) => Some(store),
             Err(e) => {
@@ -206,7 +206,7 @@ impl ResponseStoreFilter {
     }
 
     /// Return the initialized store, retrying transient Postgres failures.
-    async fn get_or_init_store(&self) -> Option<Arc<dyn ResponseStore>> {
+    async fn get_or_init_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
         if matches!(self.config.backend, StorageBackend::Postgres) {
             match self
                 .store
@@ -275,7 +275,7 @@ impl ResponseStoreFilter {
         &self,
         ctx: &HttpFilterContext<'_>,
         body: &'a Option<Bytes>,
-    ) -> Option<(&dyn ResponseStore, &'a Bytes)> {
+    ) -> Option<(&dyn PersistedStateBackend, &'a Bytes)> {
         if should_skip_persist(ctx) {
             return None;
         }
@@ -458,7 +458,7 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 
 /// Publish the initialized store into the per-request registry so
 /// downstream filters (rehydrate, compact, etc.) can read from it.
-fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn ResponseStore>) {
+fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn PersistedStateBackend>) {
     let Some(registry) = ctx.extensions.get::<ResponseStoreRegistry>() else {
         return;
     };
@@ -759,7 +759,7 @@ pub(super) fn build_record_from_state(
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
-    store: &dyn ResponseStore,
+    store: &dyn PersistedStateBackend,
     record: &ResponseRecord,
     pending_approvals: &[PendingApprovalRecord],
 ) -> Result<(), FilterError> {
@@ -1008,7 +1008,7 @@ impl ResponseStoreFilter {
     }
 
     /// Lazily initialize the store and return a clone of the `Arc`.
-    async fn ensure_store(&self) -> Option<Arc<dyn ResponseStore>> {
+    async fn ensure_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
         self.get_or_init_store().await
     }
 

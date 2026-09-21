@@ -3528,6 +3528,7 @@ dependencies = [
  "jsonschema",
  "openssl",
  "percent-encoding",
+ "praxis-ai-store",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
