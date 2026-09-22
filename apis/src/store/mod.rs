@@ -129,6 +129,7 @@ impl From<StoreRegistry> for ResponseStoreRegistry {
 }
 
 /// Registry name of the process-default response store.
+#[cfg(feature = "openai-conversations")]
 pub use crate::openai::conversations::{CONVERSATIONS_STORE_NAME, store_ref_config as conversations_store_ref_config};
 pub use crate::openai::responses::DEFAULT_STORE_NAME;
 

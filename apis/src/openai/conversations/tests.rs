@@ -11,10 +11,9 @@ use std::{
 
 use bytes::Bytes;
 use http::Method;
+use praxis_ai_store::memory::InMemoryStore;
 use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, HttpFilterContext, Request, parse_filter_config};
 use serde_json::Value;
-
-use praxis_ai_store::memory::InMemoryStore;
 
 use super::{
     CONVERSATIONS_STORE_NAME,
@@ -30,8 +29,8 @@ use crate::{
     },
     operation::{ApplicationProtocol, Transport},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PersistedStateBackend,
-        ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
+        PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
     test_utils::{make_owned_filter_context as base_owned_filter_context, make_request, make_response},
 };
@@ -41,6 +40,11 @@ fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
     let mut ctx = base_owned_filter_context(req);
     insert_classifier_matches(&mut ctx, req);
     ctx
+}
+
+/// Build the stateless conversations filter under test.
+fn build_test_filter() -> OpenaiConversationsFilter {
+    OpenaiConversationsFilter
 }
 
 /// Publish the same generic extension as `openai_operation`.
@@ -1558,9 +1562,9 @@ async fn another_protocol_match_fails_closed() {
 
 #[tokio::test]
 async fn classified_operation_missing_required_path_parameter_is_an_error() {
-    let filter = build_test_filter();
+    let (filter, store) = harness();
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_owned_filter_context(&req);
+    let mut ctx = conv_ctx(&store, &req);
     let matched = ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap();
     matched.operation_id = ConversationOperation::UpdateConversation.operation_id();
     matched.request_body = ConversationOperation::UpdateConversation.request_body();
@@ -1669,9 +1673,14 @@ async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
 
 #[tokio::test]
 async fn bodyless_operation_ignores_invalid_deferred_body_bytes() {
-    let filter = build_test_filter();
+    let (filter, store) = harness();
     let req = make_request(Method::GET, "/v1/conversations/conv_missing");
     let mut ctx = base_owned_filter_context(&req);
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(CONVERSATIONS_STORE_NAME), Arc::clone(&store))
+        .expect("conversations store should register");
+    ctx.extensions.insert(registry);
     ctx.current_filter_id = Some(7);
 
     let mut body = Some(Bytes::from_static(b"not valid json"));
@@ -4178,7 +4187,10 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
 
     // AppendDuringUpdateStore commits item_b during the handler's read, opening
     // the exact window the fix must survive.
-    let (filter, store) = harness_with(Arc::new(AppendDuringUpdateStore::new(Arc::clone(&inner), race_item("item_b"))));
+    let (filter, store) = harness_with(Arc::new(AppendDuringUpdateStore::new(
+        Arc::clone(&inner),
+        race_item("item_b"),
+    )));
 
     let req = make_request(Method::POST, "/v1/conversations/conv_race");
     let mut ctx = conv_ctx(&store, &req);
@@ -4367,6 +4379,7 @@ async fn sqlite_harness() -> TestHarness {
             "test_conversations",
             Some("test_items"),
             None,
+            None,
         )
         .await
         .expect("sqlite store should build"),
@@ -4376,10 +4389,7 @@ async fn sqlite_harness() -> TestHarness {
 
 /// Build a request context with the shared store registered under the
 /// conversations store name, so the filter resolves an owner-scoped handle.
-fn conv_ctx<'a>(
-    store: &Arc<dyn PersistedStateBackend>,
-    req: &'a praxis_filter::Request,
-) -> praxis_filter::HttpFilterContext<'a> {
+fn conv_ctx<'a>(store: &Arc<dyn PersistedStateBackend>, req: &'a Request) -> HttpFilterContext<'a> {
     let mut ctx = make_owned_filter_context(req);
     let registry = ResponseStoreRegistry::new();
     registry
@@ -4934,9 +4944,7 @@ impl ResponseStore for AppendDuringUpdateStore {
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
-        self.inner
-            .get_pending_approvals(owner, response_id, approval_ids)
-            .await
+        self.inner.get_pending_approvals(owner, response_id, approval_ids).await
     }
 
     async fn consume_approvals(
@@ -5019,7 +5027,13 @@ async fn successful_conversation_payloads(
     insert_payload(&mut payloads, create_spec, create);
 
     let get_spec = operation_spec(ConversationOperation::GetConversation);
-    let get = successful_request_json(filter, store, Method::GET, &runtime_path(get_spec, Some(&conv_id), None)).await;
+    let get = successful_request_json(
+        filter,
+        store,
+        Method::GET,
+        &runtime_path(get_spec, Some(&conv_id), None),
+    )
+    .await;
     insert_payload(&mut payloads, get_spec, get);
 
     let update_spec = operation_spec(ConversationOperation::UpdateConversation);
@@ -5047,7 +5061,13 @@ async fn successful_conversation_payloads(
     insert_payload(&mut payloads, create_items_spec, create_items);
 
     let list_spec = operation_spec(ConversationOperation::ListConversationItems);
-    let list = successful_request_json(filter, store, Method::GET, &runtime_path(list_spec, Some(&conv_id), None)).await;
+    let list = successful_request_json(
+        filter,
+        store,
+        Method::GET,
+        &runtime_path(list_spec, Some(&conv_id), None),
+    )
+    .await;
     insert_payload(&mut payloads, list_spec, list);
 
     let get_item_spec = operation_spec(ConversationOperation::GetConversationItem);
@@ -5071,8 +5091,13 @@ async fn successful_conversation_payloads(
     insert_payload(&mut payloads, delete_item_spec, delete_item);
 
     let delete_spec = operation_spec(ConversationOperation::DeleteConversation);
-    let delete =
-        successful_request_json(filter, store, Method::DELETE, &runtime_path(delete_spec, Some(&conv_id), None)).await;
+    let delete = successful_request_json(
+        filter,
+        store,
+        Method::DELETE,
+        &runtime_path(delete_spec, Some(&conv_id), None),
+    )
+    .await;
     insert_payload(&mut payloads, delete_spec, delete);
 
     payloads

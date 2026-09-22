@@ -15,9 +15,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use pingora_core::{server::ShutdownWatch, services::background::BackgroundService};
+#[cfg(feature = "openai-conversations")]
 use praxis_ai_apis::store::{
-    CONVERSATIONS_STORE_FILTER_NAME, CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME, RESPONSE_STORE_FILTER_NAME,
-    ResponseStoreRegistry, conversations_store_ref_config, store_backend_factories,
+    CONVERSATIONS_STORE_FILTER_NAME, CONVERSATIONS_STORE_NAME, conversations_store_ref_config,
+};
+use praxis_ai_apis::store::{
+    DEFAULT_STORE_NAME, RESPONSE_STORE_FILTER_NAME, ResponseStoreRegistry, store_backend_factories,
 };
 use praxis_ai_store::StoreRegistry;
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
@@ -123,6 +126,7 @@ fn response_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
 /// responses-table name the combined backend requires. The store is registered
 /// under its own name; the lifecycle cache still shares one backend with the
 /// response store when their effective configs match.
+#[cfg(feature = "openai-conversations")]
 fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
     match conversations_store_ref_config(filter_config) {
         Ok((backend_id, config)) => Some(StoreRef {
@@ -210,6 +214,7 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
         {
             refs.push(store_ref);
         }
+        #[cfg(feature = "openai-conversations")]
         if let Some(store_ref) = find_listener_store_filter(listener, &chains, CONVERSATIONS_STORE_FILTER_NAME)
             .and_then(|entry| conversations_store_ref(&entry.config))
         {
