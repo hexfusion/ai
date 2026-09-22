@@ -164,6 +164,29 @@ impl BackendCache {
     /// error so no refcount leaks.
     pub async fn provision(&self, refs: &[StoreRef]) -> Result<Provisioned, ProvisionError> {
         let registry = StoreRegistry::new();
+        let lease = self.provision_into(refs, &registry).await?;
+        Ok(Provisioned { registry, lease })
+    }
+
+    /// Provision every store reference into `registry`, reusing cached backends
+    /// and building the rest eagerly, and return the generation's lease.
+    ///
+    /// The serving runtime installs an empty registry into each pipeline before
+    /// it exists, then registers backends into that same map through a clone, so
+    /// this populates the shared handle rather than a fresh one. [`provision`]
+    /// wraps this over a private registry.
+    ///
+    /// [`provision`]: Self::provision
+    ///
+    /// # Errors
+    ///
+    /// Same as [`provision`]. References already provisioned in this call are
+    /// released on error so no refcount leaks.
+    pub async fn provision_into(
+        &self,
+        refs: &[StoreRef],
+        registry: &StoreRegistry,
+    ) -> Result<BackendLease, ProvisionError> {
         let mut held: Vec<CacheKey> = Vec::new();
         let mut this_gen: HashSet<CacheKey> = HashSet::new();
 
@@ -184,12 +207,9 @@ impl BackendCache {
             }
         }
 
-        Ok(Provisioned {
-            registry,
-            lease: BackendLease {
-                entries: Arc::clone(&self.entries),
-                keys: held,
-            },
+        Ok(BackendLease {
+            entries: Arc::clone(&self.entries),
+            keys: held,
         })
     }
 
@@ -637,6 +657,26 @@ mod tests {
         assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
         assert!(provisioned.registry.contains("responses"));
         assert!(provisioned.registry.contains("conversations"));
+    }
+
+    #[tokio::test]
+    async fn provision_into_populates_a_shared_registry() {
+        let factory = FakeFactory::new("fake", Behavior::Ok);
+        let cache = BackendCache::new(vec![as_dyn(factory)]);
+        let shared = StoreRegistry::new();
+
+        // A clone shares the backing map, as the serving-runtime install does.
+        let installed = shared.clone();
+        let lease = cache
+            .provision_into(&[store_ref("default", "fake", "a")], &shared)
+            .await
+            .expect("provision into shared registry");
+
+        assert!(
+            installed.contains("default"),
+            "backend visible through the shared clone"
+        );
+        lease.release().await;
     }
 
     #[test]

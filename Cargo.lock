@@ -3644,6 +3644,7 @@ dependencies = [
 name = "praxis-ai-proxy"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cargo_metadata",
  "clap",
@@ -3653,12 +3654,15 @@ dependencies = [
  "praxis-ai-build-support",
  "praxis-ai-filters",
  "praxis-ai-llmd-ext-proc",
+ "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
