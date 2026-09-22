@@ -7,7 +7,7 @@ pub(crate) mod pipelines;
 pub(crate) mod reload;
 mod server;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-pub(crate) mod store_provision;
+pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;

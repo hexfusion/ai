@@ -61,6 +61,7 @@ fn resolve_listener_pipeline(
     listener: &Listener,
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
+    store_registry: praxis_ai_apis::store::ResponseStoreRegistry,
 ) -> Arc<FilterPipeline> {
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
@@ -92,6 +93,10 @@ fn resolve_listener_pipeline(
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     praxis_ai::install_pipeline_extensions(&mut pipeline);
+    // Share the registry the store provisioner populates, so store-filter
+    // requests through the harness resolve a provisioned backend.
+    pipeline.add_pipeline_extension(Box::new(store_registry));
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
     Arc::new(pipeline)
 }
@@ -113,8 +118,14 @@ pub fn build_pipeline(config: &Config) -> FilterPipeline {
         .first()
         .expect("config must have at least one listener");
 
-    Arc::try_unwrap(resolve_listener_pipeline(config, listener, &registry, &client))
-        .unwrap_or_else(|_| panic!("pipeline Arc should have single owner"))
+    Arc::try_unwrap(resolve_listener_pipeline(
+        config,
+        listener,
+        &registry,
+        &client,
+        praxis_ai_apis::store::ResponseStoreRegistry::new(),
+    ))
+    .unwrap_or_else(|_| panic!("pipeline Arc should have single owner"))
 }
 
 // -----------------------------------------------------------------------------
@@ -295,6 +306,13 @@ impl Drop for ProxyGuard {
 /// and the optional admin endpoint.
 ///
 /// [`Server`]: pingora_core::server::Server
+#[cfg_attr(
+    any(feature = "store-postgres", feature = "store-sqlite"),
+    expect(
+        clippy::too_many_lines,
+        reason = "listener wiring plus store provisioning mirror boot_server"
+    )
+)]
 fn build_pingora_server(
     config: &Config,
     registry: &FilterRegistry,
@@ -302,10 +320,25 @@ fn build_pingora_server(
 ) -> pingora_core::server::Server {
     let mut server = praxis_core::server::build_http_server(config.shutdown_timeout_secs, &RuntimeOptions::default());
 
+    // Provision the response store on this server's runtime, mirroring boot_server:
+    // build the per-listener registries plus the background service, install the
+    // shared registries into the pipelines, and register the service so
+    // store-filter requests through the harness resolve a provisioned backend.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let (store_registries, store_service) =
+        praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
+
     let mut cert_shutdowns = Vec::new();
     for listener in &config.listeners {
+        let store_registry = store_registries.get(&listener.name).cloned().unwrap_or_default();
         let pipeline = Arc::new(ArcSwap::from(resolve_listener_pipeline(
-            config, listener, registry, client,
+            config,
+            listener,
+            registry,
+            client,
+            store_registry,
         )));
         load_http_handler(&mut server, listener, pipeline, &mut cert_shutdowns).unwrap();
     }
@@ -318,6 +351,14 @@ fn build_pingora_server(
             None,
             config.admin.verbose,
         );
+    }
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    if let Some(service) = store_service {
+        server.add_service(pingora_core::services::background::background_service(
+            "store-provision",
+            service,
+        ));
     }
 
     server

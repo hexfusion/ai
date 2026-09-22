@@ -94,7 +94,7 @@ fn registries_map(plans: &[ListenerStorePlan]) -> HashMap<String, ResponseStoreR
 
 /// The per-listener registries to install into pipelines, plus the provisioner
 /// when any store is configured.
-pub(crate) type StoreWiring = (HashMap<String, ResponseStoreRegistry>, Option<StoreProvisionService>);
+pub type StoreWiring = (HashMap<String, ResponseStoreRegistry>, Option<StoreProvisionService>);
 
 /// Build the per-listener store registries to install into pipelines and, when
 /// any store is configured, the serving-runtime provisioner.
@@ -107,7 +107,7 @@ pub(crate) type StoreWiring = (HashMap<String, ResponseStoreRegistry>, Option<St
 ///
 /// Returns [`ProvisionError`] when a configured store names an unknown backend
 /// or its configuration is rejected.
-pub(crate) fn build_store_wiring(config: &Config) -> Result<StoreWiring, ProvisionError> {
+pub fn build_store_wiring(config: &Config) -> Result<StoreWiring, ProvisionError> {
     let plans = build_listener_store_plans(config);
     let registries = registries_map(&plans);
     if plans.is_empty() {
@@ -121,7 +121,7 @@ pub(crate) fn build_store_wiring(config: &Config) -> Result<StoreWiring, Provisi
 
 /// Provisions response-store backends on the serving runtime and holds their
 /// leases for the process lifetime.
-pub(crate) struct StoreProvisionService {
+pub struct StoreProvisionService {
     /// Process-wide backend cache built from the compiled-in factories.
     cache: Arc<BackendCache>,
     /// Per-listener registries and references to provision.
