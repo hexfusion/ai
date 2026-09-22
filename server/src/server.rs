@@ -166,8 +166,10 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
+    // The readiness handle is consumed by the readiness endpoint (added
+    // separately). The harness holds its own handle from its own wiring call.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    let (store_registries, store_service) =
+    let (store_registries, store_service, _store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
     #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
     let store_registries: HashMap<String, ResponseStoreRegistry> = HashMap::new();
