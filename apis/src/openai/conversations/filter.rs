@@ -28,8 +28,9 @@ use super::{
 use crate::{
     openai::{operation_classifier::OpenAiOperationMatch, responses::state::ResponsesState},
     operation::Transport,
+    service::conversations::{ConversationsService, build_item_records},
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseStoreRegistry},
+    store::ResponseStoreRegistry,
 };
 
 // -----------------------------------------------------------------------------
@@ -88,15 +89,17 @@ fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAct
     Ok(())
 }
 
-/// Resolve the owner-scoped conversations store from the per-request registry.
+/// Resolve the owner-scoped conversations service from the per-request registry.
 ///
 /// Mirrors the response-store filter: the store is provisioned into the registry
 /// on the serving runtime, and the filter takes an owner-bound handle at request
-/// time. `None` when no registry is installed or the store is not provisioned.
-fn resolve_store(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<OwnerScopedResponseStore> {
+/// time and wraps it in the service. `None` when no registry is installed or the
+/// store is not provisioned.
+fn resolve_service(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<ConversationsService> {
     ctx.extensions
         .get::<ResponseStoreRegistry>()
         .and_then(|registry| registry.get_scoped(CONVERSATIONS_STORE_NAME, owner))
+        .map(ConversationsService::new)
 }
 
 impl OpenaiConversationsFilter {
@@ -115,14 +118,14 @@ impl OpenaiConversationsFilter {
         Ok(Box::new(Self))
     }
 
-    /// Resolve the owner-scoped store, or the fail-closed action to return.
+    /// Resolve the owner-scoped service, or the fail-closed action to return.
     ///
-    /// The owner is server-set from trusted request context; the returned handle
+    /// The owner is server-set from trusted request context; the returned service
     /// binds every store operation to it. A missing owner yields the auth action;
     /// an unprovisioned store yields a 500 rejection.
-    fn scoped_store(ctx: &HttpFilterContext<'_>) -> Result<OwnerScopedResponseStore, FilterAction> {
+    fn scoped_service(ctx: &HttpFilterContext<'_>) -> Result<ConversationsService, FilterAction> {
         let owner = require_state_owner(ctx)?;
-        resolve_store(ctx, owner).ok_or_else(|| FilterAction::Reject(reject_store_unavailable()))
+        resolve_service(ctx, owner).ok_or_else(|| FilterAction::Reject(reject_store_unavailable()))
     }
 
     /// Mark the request phase complete and return any body captured earlier.
@@ -221,22 +224,22 @@ impl OpenaiConversationsFilter {
     /// Dispatch a matched body to the appropriate local handler.
     async fn handle_body_operation(
         ctx: &HttpFilterContext<'_>,
-        store: &OwnerScopedResponseStore,
+        service: &ConversationsService,
         matched: OpenAiOperationMatch,
         operation: ConversationOperation,
         body: &[u8],
     ) -> Result<FilterAction, FilterError> {
         match operation {
-            ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, store, body).await,
+            ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, service, body).await,
             ConversationOperation::UpdateConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched update route missing id"))?;
-                handlers::handle_update_conversation(store, id, body).await
+                handlers::handle_update_conversation(service, id, body).await
             },
             ConversationOperation::CreateConversationItems => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched item create route missing id"))?;
-                handlers::handle_create_items(ctx, store, id, body).await
+                handlers::handle_create_items(ctx, service, id, body).await
             },
             ConversationOperation::GetConversation
             | ConversationOperation::DeleteConversation
@@ -262,11 +265,11 @@ impl OpenaiConversationsFilter {
         let Some(body) = Self::mark_request_filters_ran(ctx) else {
             return Ok(FilterAction::Continue);
         };
-        let store = match Self::scoped_store(ctx) {
-            Ok(store) => store,
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
             Err(action) => return Ok(action),
         };
-        Box::pin(Self::handle_body_operation(ctx, &store, matched, operation, &body)).await
+        Box::pin(Self::handle_body_operation(ctx, &service, matched, operation, &body)).await
     }
 
     /// Dispatch a bodyless conversation operation to its local handler.
@@ -277,32 +280,32 @@ impl OpenaiConversationsFilter {
         matched: OpenAiOperationMatch,
         operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
-        let store = match Self::scoped_store(ctx) {
-            Ok(store) => store,
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
             Err(action) => return Ok(action),
         };
         match operation {
             ConversationOperation::GetConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
-                handlers::handle_get_conversation(&store, id).await
+                handlers::handle_get_conversation(&service, id).await
             },
             ConversationOperation::ListConversationItems => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
-                handlers::handle_list_items(ctx, &store, id).await
+                handlers::handle_list_items(ctx, &service, id).await
             },
             ConversationOperation::GetConversationItem => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
                 let item_id = Self::path_parameter(ctx, &matched, "item_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
-                handlers::handle_get_item(ctx, &store, id, item_id).await
+                handlers::handle_get_item(ctx, &service, id, item_id).await
             },
             ConversationOperation::DeleteConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
-                handlers::handle_delete_conversation(&store, id).await
+                handlers::handle_delete_conversation(&service, id).await
             },
             ConversationOperation::DeleteConversationItem => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
@@ -310,7 +313,7 @@ impl OpenaiConversationsFilter {
                 let item_id = Self::path_parameter(ctx, &matched, "item_id").ok_or_else(|| {
                     FilterError::from("openai_conversations: matched delete item route missing item id")
                 })?;
-                handlers::handle_delete_item(&store, id, item_id).await
+                handlers::handle_delete_item(&service, id, item_id).await
             },
             ConversationOperation::CreateConversation
             | ConversationOperation::UpdateConversation
@@ -322,7 +325,7 @@ impl OpenaiConversationsFilter {
 
     /// Persist conversation items synchronously using `block_in_place`.
     ///
-    /// The store is resolved for the captured append owner, so the handle is
+    /// The service is resolved for the captured append owner, so the handle is
     /// bound to the same owner the exchange authenticated as.
     fn append_items_blocking(
         owner: &StateOwner,
@@ -330,11 +333,11 @@ impl OpenaiConversationsFilter {
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
     ) -> Result<(), FilterError> {
-        let store = resolve_store(ctx, owner)
+        let service = resolve_service(ctx, owner)
             .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
 
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(persist_items(&store, conversation_id, ctx, items)))
+        tokio::task::block_in_place(|| handle.block_on(persist_items(&service, conversation_id, ctx, items)))
     }
 }
 
@@ -433,11 +436,11 @@ impl HttpFilter for OpenaiConversationsFilter {
 
         let empty: &[u8] = &[];
         let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
-        let store = match Self::scoped_store(ctx) {
-            Ok(store) => store,
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
             Err(action) => return Ok(action),
         };
-        Box::pin(Self::handle_body_operation(ctx, &store, matched, operation, bytes)).await
+        Box::pin(Self::handle_body_operation(ctx, &service, matched, operation, bytes)).await
     }
 
     #[expect(
@@ -620,23 +623,25 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
 /// Records are built with the handle's bound owner, so the owner-scoped write
 /// path accepts them; a record under any other owner would be rejected.
 async fn persist_items(
-    store: &OwnerScopedResponseStore,
+    service: &ConversationsService,
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
 ) -> Result<(), FilterError> {
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(ctx, store.owner(), conversation_id, created_at, 0, items)
-        .map_err(|e| -> FilterError { e.into() })?;
+    let records = build_item_records(service.owner(), conversation_id, created_at, 0, items, || {
+        handlers::generated_item_id(ctx)
+    })
+    .map_err(|e| -> FilterError { Box::new(e) })?;
 
     if records.is_empty() {
         return Ok(());
     }
 
     let count = records.len();
-    store
-        .create_items_and_sync_messages(conversation_id, &records)
+    service
+        .create_items(conversation_id, &records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 

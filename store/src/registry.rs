@@ -46,6 +46,16 @@ pub struct OwnerScopedStore {
 }
 
 impl OwnerScopedStore {
+    /// The validated owner every operation on this handle is bound to.
+    ///
+    /// Server-set at [`StoreRegistry::get_scoped`]; exposed read-only so a caller
+    /// can stamp records with the bound scope rather than passing an owner that
+    /// the write path would then have to re-check.
+    #[must_use]
+    pub fn owner(&self) -> &StateOwner {
+        &self.owner
+    }
+
     /// Retrieve a response visible to this owner.
     ///
     /// # Errors
