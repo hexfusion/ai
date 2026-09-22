@@ -345,7 +345,16 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    // The store is provisioned into the registry outside the filter; back it by
+    // the same file the previous response was seeded into so rehydrate finds it.
+    let provisioned = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+        .await
+        .unwrap();
+    let store_registry = ResponseStoreRegistry::new();
+    store_registry
+        .register(&Arc::from("default"), Arc::new(provisioned))
+        .unwrap();
+    pipeline.add_pipeline_extension(Box::new(store_registry));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);

@@ -236,21 +236,6 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Re-validate only the `PostgreSQL` host/IP portions of the
-/// connection URL immediately before `SQLx` resolves and connects.
-///
-/// Full config validation runs once at construction time in
-/// [`validate_config`]. This narrower check guards against DNS
-/// rebinding between validation and connection by re-checking
-/// the SSRF-sensitive host rules on every retry without
-/// redundantly re-validating immutable fields (table names, SSL
-/// config, URL scheme).
-#[cfg(feature = "store-postgres")]
-pub(crate) fn revalidate_postgres_host(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
-    let database_url = cfg.database_url.expose_secret();
-    postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
-}
-
 /// Validate `PostgreSQL` TLS options.
 #[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
