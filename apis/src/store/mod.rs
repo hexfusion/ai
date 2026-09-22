@@ -148,3 +148,21 @@ impl praxis_filter::PipelineExtension for ResponseStoreRegistry {
         extensions.insert(self.clone());
     }
 }
+
+impl From<StoreRegistry> for ResponseStoreRegistry {
+    /// Wrap a registry, sharing its backing storage.
+    ///
+    /// The serving-runtime provisioner installs an empty registry into a pipeline
+    /// and later registers backends into the same map through a clone, so the
+    /// pipeline observes the backends once provisioning completes.
+    fn from(inner: StoreRegistry) -> Self {
+        Self { inner }
+    }
+}
+
+/// Registry name of the process-default response store.
+pub use crate::openai::responses::DEFAULT_STORE_NAME;
+
+/// Filter type that configures the response store. The serving runtime scans
+/// filter chains for this type to provision the backends the store filter reads.
+pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_response_store";

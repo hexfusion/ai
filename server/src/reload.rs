@@ -3,8 +3,12 @@
 
 //! Hot config reload: validate, build, and atomically swap filter pipelines.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
+use praxis_ai_apis::store::{RESPONSE_STORE_FILTER_NAME, ResponseStoreRegistry};
 use praxis_core::{
     config::Config,
     health::{HealthRegistry, build_health_registry},
@@ -14,7 +18,7 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::pipelines::resolve_pipelines;
+use crate::pipelines::resolve_pipelines_with_stores;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -52,6 +56,7 @@ pub(crate) fn reload_pipelines(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    store_registries: &HashMap<String, ResponseStoreRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("building new pipelines from reloaded config");
 
@@ -68,7 +73,18 @@ pub(crate) fn reload_pipelines(
         new_ceiling,
     );
 
-    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client) {
+    // Reuse the serving-runtime-provisioned store registries: the reloaded
+    // pipeline shares the same backends. Store pools bind to the serving
+    // runtime, and reload runs on the watcher runtime, so a changed store
+    // config is restart-required rather than re-provisioned here.
+    let new_pipelines = match resolve_pipelines_with_stores(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        &updated_client,
+        store_registries,
+    ) {
         Ok(p) => p,
         Err(e) => {
             error!(error = %e, "config reload failed: pipeline build error");
@@ -157,6 +173,27 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
     detect_subrequest_connector_changes(old, new);
+    detect_store_config_changes(old, new);
+}
+
+/// Warn when the response-store configuration changed. Store pools bind to the
+/// serving runtime and reload runs on the watcher runtime, so a store change is
+/// restart-required and the reloaded pipeline keeps the existing backends.
+fn detect_store_config_changes(old: &Config, new: &Config) {
+    if store_filter_configs(old) != store_filter_configs(new) {
+        warn!("response store configuration changed and requires restart to re-provision");
+    }
+}
+
+/// Collect the response-store filter configs across all chains, for comparison.
+fn store_filter_configs(config: &Config) -> Vec<&serde_yaml::Value> {
+    config
+        .filter_chains
+        .iter()
+        .flat_map(|c| c.filters.iter())
+        .filter(|e| e.filter_type == RESPONSE_STORE_FILTER_NAME)
+        .map(|e| &e.config)
+        .collect()
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -369,6 +406,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
+    use crate::pipelines::resolve_pipelines;
 
     #[test]
     fn valid_reload_swaps_pipeline() {
@@ -384,6 +422,7 @@ mod tests {
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         );
 
         assert!(result.is_ok(), "valid reload should succeed");
@@ -418,6 +457,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
@@ -439,6 +479,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -462,6 +503,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -500,6 +542,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         );
         assert!(
             !old_token.is_cancelled(),
@@ -537,6 +580,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &HashMap::new(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
         assert!(

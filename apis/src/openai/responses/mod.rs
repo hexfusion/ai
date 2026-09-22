@@ -184,8 +184,7 @@ impl io::Write for BoundedJsonCounter {
 
 /// Default store name used when registering the response store in the
 /// per-request registry.
-#[cfg(feature = "store")]
-pub(crate) const DEFAULT_STORE_NAME: &str = "default";
+pub const DEFAULT_STORE_NAME: &str = "default";
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
