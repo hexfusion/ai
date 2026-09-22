@@ -26,6 +26,8 @@ pub mod openai;
 pub mod operation;
 mod project_state_owner_headers;
 pub mod promotion;
+#[cfg(feature = "store")]
+pub(crate) mod service;
 mod state_owner;
 #[cfg(feature = "store")]
 pub mod store;
