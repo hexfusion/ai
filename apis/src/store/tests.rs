@@ -3317,24 +3317,26 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
+    use super::postgres::to_pg_ssl_mode;
+
     assert!(
-        matches!(PgSslMode::from(SslMode::Disable), PgSslMode::Disable),
+        matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),
         "Disable should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Prefer), PgSslMode::Prefer),
+        matches!(to_pg_ssl_mode(SslMode::Prefer), PgSslMode::Prefer),
         "Prefer should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Require), PgSslMode::Require),
+        matches!(to_pg_ssl_mode(SslMode::Require), PgSslMode::Require),
         "Require should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyCa), PgSslMode::VerifyCa),
+        matches!(to_pg_ssl_mode(SslMode::VerifyCa), PgSslMode::VerifyCa),
         "VerifyCa should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyFull), PgSslMode::VerifyFull),
+        matches!(to_pg_ssl_mode(SslMode::VerifyFull), PgSslMode::VerifyFull),
         "VerifyFull should map"
     );
 }

@@ -3,6 +3,8 @@
 
 //! SQL schema generation for the response store.
 
+use praxis_ai_store::validate_table_identifier as validate_identifier;
+
 use super::StoreError;
 
 // -----------------------------------------------------------------------------
@@ -335,11 +337,6 @@ fn validate_table_names(tables: &TableNames) -> Result<(&str, &str), StoreError>
     Ok((r, c))
 }
 
-/// Maximum length for a table name identifier.
-/// SQLite has no identifier length limit, but we cap table names
-/// to prevent pathological DDL strings from config input.
-const MAX_IDENTIFIER_LEN: usize = 128;
-
 /// Maximum identifier length accepted by `PostgreSQL`.
 #[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
@@ -366,32 +363,6 @@ const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SC
 #[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
     POSTGRES_MAX_IDENTIFIER_LEN - PENDING_APPROVALS_SUFFIX.len();
-
-/// Reject identifiers that could cause SQL injection or invalid DDL.
-pub(crate) fn validate_identifier(name: &str) -> Result<(), StoreError> {
-    if name.is_empty() {
-        return Err(StoreError::Database("table name must not be empty".to_owned()));
-    }
-    if name.len() > MAX_IDENTIFIER_LEN {
-        return Err(StoreError::Database(format!(
-            "table name exceeds {MAX_IDENTIFIER_LEN} characters: {name}"
-        )));
-    }
-    if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
-        return Err(StoreError::Database(format!(
-            "table name must start with a letter or underscore: {name}"
-        )));
-    }
-    // Hyphens are valid in quoted SQLite identifiers but we
-    // interpolate table names unquoted in SQL statements, so
-    // restrict to alphanumeric + underscore to avoid quoting.
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Err(StoreError::Database(format!(
-            "table name contains invalid characters: {name}"
-        )));
-    }
-    Ok(())
-}
 
 /// Validate the items table name and ensure it is distinct from the
 /// responses and conversations tables.
@@ -935,6 +906,8 @@ pub(crate) fn pg_key_column_folding(
     reason = "tests"
 )]
 mod tests {
+    use praxis_ai_store::MAX_IDENTIFIER_LEN;
+
     use super::*;
 
     #[test]
