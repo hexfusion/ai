@@ -95,7 +95,7 @@ container-run: | require-container-engine
 # -------------------------------------------------------------------
 
 test:
-	cargo test --workspace $(_NOCAPTURE)
+	cargo test --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) $(_NOCAPTURE)
 
 # `make test-unit` runs every crate's permutations serially for local use; CI
 # splits these into the test-unit-{apis,filters,proxy} targets so the three
