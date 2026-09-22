@@ -91,6 +91,10 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
 /// config watcher, and run.
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
+#[cfg_attr(
+    any(feature = "store-postgres", feature = "store-sqlite"),
+    expect(clippy::too_many_lines, reason = "store provisioning and readiness registration")
+)]
 fn boot_server(
     config: Config,
     registry: FilterRegistry,
@@ -113,6 +117,8 @@ fn boot_server(
     info!("initializing server");
     let mut server = PingoraServerRuntime::new(&config);
     let _cert_shutdowns = register_protocols(&mut server, &config, &state.pipelines);
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let health_registry_for_readiness = Arc::clone(&health_registry);
     register_admin_endpoints(&mut server, &config, health_registry, &state.kv_stores);
 
     // Provision response-store backends on the serving runtime, before run().
@@ -124,6 +130,11 @@ fn boot_server(
                 "store-provision",
                 service,
             ));
+        register_store_readiness_endpoint(
+            &mut server,
+            state.store_readiness.clone(),
+            health_registry_for_readiness,
+        );
     }
 
     let _watcher = spawn_watcher(config_path, config, registry, state);
@@ -154,9 +165,20 @@ struct ServerState {
     /// as a Pingora background service before the server runs.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
     store_service: Option<crate::store_provision::StoreProvisionService>,
+    /// Readiness handle the store provisioner drives, read by the readiness
+    /// endpoint.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    store_readiness: crate::store_provision::StoreReadinessHandle,
 }
 
 /// Build filter pipelines, health checks, and registries.
+#[cfg_attr(
+    any(feature = "store-postgres", feature = "store-sqlite"),
+    expect(
+        clippy::too_many_lines,
+        reason = "store wiring adds registry, provisioner, and readiness"
+    )
+)]
 fn build_server_state(
     config: &Config,
     registry: &FilterRegistry,
@@ -166,10 +188,8 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    // The readiness handle is consumed by the readiness endpoint (added
-    // separately). The harness holds its own handle from its own wiring call.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    let (store_registries, store_service, _store_readiness) =
+    let (store_registries, store_service, store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
     #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
     let store_registries: HashMap<String, ResponseStoreRegistry> = HashMap::new();
@@ -200,6 +220,8 @@ fn build_server_state(
         store_registries,
         #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
         store_service,
+        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        store_readiness,
     }
 }
 
@@ -279,6 +301,29 @@ fn register_admin_endpoints(
             },
         );
     }
+}
+
+/// Register the store-readiness endpoint on its own listener when its address is
+/// configured (via the readiness env var).
+///
+/// It runs on a separate port because the protocol admin service owns its route
+/// set. It reads the provisioning readiness handle and composes it with cluster
+/// health, so an orchestrator probe gates traffic on store provisioning.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+fn register_store_readiness_endpoint(
+    server: &mut PingoraServerRuntime,
+    readiness: crate::store_provision::StoreReadinessHandle,
+    health_registry: HealthRegistry,
+) {
+    if std::env::var(crate::readiness::READINESS_ADDR_ENV).is_err() {
+        return;
+    }
+    let addr = crate::readiness::readiness_addr();
+    let app = crate::readiness::StoreReadinessService::new(readiness, Some(health_registry));
+    let mut service = pingora_core::services::listening::Service::new("store-readiness".to_owned(), app);
+    service.add_tcp(&addr);
+    info!(address = %addr, path = crate::readiness::READINESS_PATH, "store readiness endpoint enabled");
+    server.server_mut().add_service(service);
 }
 
 // -----------------------------------------------------------------------------
