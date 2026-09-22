@@ -26,13 +26,16 @@ use super::{
     item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},
 };
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+use crate::store::ConversationItemStore;
 use crate::{
     openai::{
         include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
         responses::store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
     },
-    state_owner::{StateOwner, require_state_owner},
-    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
+    state_owner::StateOwner,
+    store::{ConversationItemRecord, ConversationRecord, OwnerScopedResponseStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -83,13 +86,10 @@ impl Default for ItemListParams {
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_conversation(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = store.owner();
     let input = if body.is_empty() {
         CreateConversationRequest::default()
     } else {
@@ -138,7 +138,7 @@ pub(super) async fn handle_create_conversation(
     }
     if !item_records.is_empty()
         && let Err(e) = store
-            .create_items_and_sync_messages(owner, &conversation_id, &item_records)
+            .create_items_and_sync_messages(&conversation_id, &item_records)
             .await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
@@ -151,21 +151,16 @@ pub(super) async fn handle_create_conversation(
 
 /// Handle `GET /v1/conversations/{id}` — retrieve a conversation.
 pub(super) async fn handle_get_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(record)) => {
             let body = conversation_response(record);
             Ok(FilterAction::Reject(json_response(200, &body)?))
@@ -183,15 +178,10 @@ pub(super) async fn handle_get_conversation(
 /// Handle `POST /v1/conversations/{id}` — update a conversation.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_update_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -219,7 +209,7 @@ pub(super) async fn handle_update_conversation(
         }));
     }
 
-    let existing = match store.get_conversation(owner, conversation_id).await {
+    let existing = match store.get_conversation(conversation_id).await {
         Ok(record) => record,
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
@@ -238,10 +228,7 @@ pub(super) async fn handle_update_conversation(
     // meantime and dropping those committed items from conversation-backed
     // rehydration (#1144). `created_at` is immutable, so the read above still
     // supplies it for the response.
-    match store
-        .update_conversation_metadata(owner, conversation_id, &metadata)
-        .await
-    {
+    match store.update_conversation_metadata(conversation_id, &metadata).await {
         Ok(true) => {},
         Ok(false) => {
             // The conversation was deleted between the read above and this write.
@@ -269,21 +256,16 @@ pub(super) async fn handle_update_conversation(
 /// its items; item cleanup belongs to item deletion or a separate retention
 /// policy, not this endpoint.
 pub(super) async fn handle_delete_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.delete_conversation(owner, conversation_id).await {
+    match store.delete_conversation(conversation_id).await {
         Ok(true) => {
             debug!(conversation_id, "conversation deleted");
             let body = DeletedConversationResource::deleted(conversation_id);
@@ -307,14 +289,11 @@ pub(super) async fn handle_delete_conversation(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = store.owner();
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -328,7 +307,7 @@ pub(super) async fn handle_create_items(
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item create");
@@ -358,7 +337,7 @@ pub(super) async fn handle_create_items(
     }
     let requested_ids: Vec<&str> = item_records.iter().map(|r| r.item_id.as_str()).collect();
     let already_present = match store
-        .get_existing_conversation_item_ids(owner, conversation_id, &requested_ids)
+        .get_existing_conversation_item_ids(conversation_id, &requested_ids)
         .await
     {
         Ok(ids) => ids,
@@ -371,7 +350,7 @@ pub(super) async fn handle_create_items(
     }
 
     if let Err(e) = store
-        .create_items_and_sync_messages(owner, conversation_id, &item_records)
+        .create_items_and_sync_messages(conversation_id, &item_records)
         .await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
@@ -390,13 +369,9 @@ pub(super) async fn handle_create_items(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_list_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -410,7 +385,7 @@ pub(super) async fn handle_list_items(
         Ok(params) => params,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item list");
@@ -424,7 +399,6 @@ pub(super) async fn handle_list_items(
     let limit = params.limit;
     let rows = match store
         .list_conversation_items(
-            owner,
             conversation_id,
             params.after_item_id.as_deref(),
             limit.saturating_add(1),
@@ -447,14 +421,10 @@ pub(super) async fn handle_list_items(
 #[expect(clippy::too_many_lines, reason = "decode both path parameters then look up")]
 pub(super) async fn handle_get_item(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -469,7 +439,7 @@ pub(super) async fn handle_get_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item get");
@@ -479,7 +449,7 @@ pub(super) async fn handle_get_item(
         },
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
-    match store.get_conversation_item(owner, conversation_id, item_id).await {
+    match store.get_conversation_item(conversation_id, item_id).await {
         Ok(Some(record)) => {
             let mut item_data = record.item_data;
             project_item(&mut item_data, includes);
@@ -500,15 +470,10 @@ pub(super) async fn handle_get_item(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 #[expect(clippy::cognitive_complexity, reason = "tracing macros inflate complexity")]
 pub(super) async fn handle_delete_item(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    store: &OwnerScopedResponseStore,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -519,7 +484,7 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match store.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item delete");
@@ -530,13 +495,10 @@ pub(super) async fn handle_delete_item(
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
 
-    match store
-        .delete_item_and_sync_messages(owner, conversation_id, item_id)
-        .await
-    {
+    match store.delete_item_and_sync_messages(conversation_id, item_id).await {
         Ok(true) => {
             debug!(conversation_id, item_id, "conversation item deleted");
-            match store.get_conversation(owner, conversation_id).await {
+            match store.get_conversation(conversation_id).await {
                 Ok(Some(record)) => {
                     let body = conversation_response(record);
                     Ok(FilterAction::Reject(json_response(200, &body)?))
