@@ -13,24 +13,8 @@
 #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
 use praxis_ai_store::BackendError;
 
-/// Scrub a connection string, and any credentials embedded in it, from an error
-/// message before it reaches [`StoreError::Database`] or a log line.
-///
-/// [`StoreError::Database`]: praxis_ai_store::StoreError::Database
 #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
-fn redact_connection_error(url: &str, message: &str) -> String {
-    let base = message.replace(url, "<redacted database url>");
-    // Best effort for a `scheme://user:pass@host` credential echoed separately
-    // from the full url: drop the userinfo segment. split_once avoids byte
-    // indexing, which could split a UTF-8 character.
-    let Some((before, rest)) = base.split_once("://") else {
-        return base;
-    };
-    match rest.split_once('@') {
-        Some((_userinfo, after_at)) => format!("{before}://<redacted credentials>@{after_at}"),
-        None => format!("{before}://{rest}"),
-    }
-}
+use super::redact_connection_error;
 
 /// A permanent build failure, redacted, as a backend-unavailable error.
 #[cfg(feature = "store-sqlite")]

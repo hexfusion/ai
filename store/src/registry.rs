@@ -87,6 +87,25 @@ impl OwnerScopedStore {
         self.store.upsert_response(record).await
     }
 
+    /// Persist a response and the pending approvals it issued, only when the
+    /// record's immutable owner matches this handle. The backend commits both in
+    /// one transaction so a concurrent delete cannot orphan an approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store
+            .persist_response_with_pending_approvals(record, pending_approvals)
+            .await
+    }
+
     /// Retrieve pending approvals issued to this owner.
     ///
     /// # Errors

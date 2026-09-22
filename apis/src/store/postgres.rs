@@ -56,6 +56,8 @@ pub struct PostgresResponseStore {
     tables: TableNames,
     /// Payload compression codec applied on write.
     compression: StoreCompressionConfig,
+    /// Connection URL, held only to redact it from runtime query errors.
+    redact_url: String,
 }
 
 impl PostgresResponseStore {
@@ -95,6 +97,7 @@ impl PostgresResponseStore {
         clippy::too_many_lines,
         reason = "distinct connection, table-name, TLS, pool, and compression inputs are clearer passed explicitly than bundled"
     )]
+    #[expect(clippy::too_many_lines, reason = "schema setup plus the retained connection URL")]
     pub async fn new(
         database_url: &str,
         responses_table: &str,
@@ -139,6 +142,7 @@ impl PostgresResponseStore {
             pool,
             tables,
             compression: compression.cloned().unwrap_or_default(),
+            redact_url: database_url.to_owned(),
         })
     }
 
@@ -148,6 +152,12 @@ impl PostgresResponseStore {
     /// reload does not leak pools.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Wrap a runtime query error, redacting the connection URL and any embedded
+    /// credentials before it becomes a [`StoreError::Database`].
+    fn db_err(&self, e: impl std::fmt::Display) -> StoreError {
+        StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -178,7 +188,7 @@ impl PostgresResponseStore {
             .bind(&messages)
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "conversation")
     }
 
@@ -203,7 +213,7 @@ impl PostgresResponseStore {
             .bind(owner.subject())
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         row.map(|r| row_to_conversation_record(&r)).transpose()
     }
@@ -222,7 +232,7 @@ impl PostgresResponseStore {
             .bind(owner.subject())
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -573,7 +583,7 @@ impl ResponseStore for PostgresResponseStore {
             .bind(&messages)
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "response")
     }
 
@@ -593,7 +603,7 @@ impl ResponseStore for PostgresResponseStore {
             .bind(owner.subject())
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         match row {
             Some(row) => run_blocking(move || row_to_response_record(&row)).await.map(Some),
@@ -613,9 +623,7 @@ impl ResponseStore for PostgresResponseStore {
             "DELETE FROM {} WHERE response_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             pending_approvals_table(&self.tables.responses)
         );
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
         let result = sqlx::query(AssertSqlSafe(delete_response_sql.as_str()))
             .bind(id)
             .bind(owner.tenant_id())
@@ -623,7 +631,7 @@ impl ResponseStore for PostgresResponseStore {
             .bind(owner.subject())
             .execute(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
         sqlx::query(AssertSqlSafe(delete_approvals_sql.as_str()))
             .bind(id)
             .bind(owner.tenant_id())
@@ -631,8 +639,8 @@ impl ResponseStore for PostgresResponseStore {
             .bind(owner.subject())
             .execute(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -670,9 +678,7 @@ impl ResponseStore for PostgresResponseStore {
             self.tables.responses
         );
 
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         for record in records {
             sqlx::query(AssertSqlSafe(sql.as_str()))
@@ -693,10 +699,10 @@ impl ResponseStore for PostgresResponseStore {
                 .bind(owner.subject())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| self.db_err(&e))?;
         }
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
     }
 
@@ -746,9 +752,7 @@ impl ResponseStore for PostgresResponseStore {
         // together or not at all. Serialized against delete_response, this closes
         // the window where a concurrent DELETE could land between the two writes
         // and orphan an approval row still holding the tool arguments.
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let result = sqlx::query(AssertSqlSafe(upsert_sql.as_str()))
             .bind(&record.id)
@@ -762,7 +766,7 @@ impl ResponseStore for PostgresResponseStore {
             .bind(&messages)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "response")?;
 
         for approval in pending_approvals {
@@ -784,10 +788,10 @@ impl ResponseStore for PostgresResponseStore {
                 .bind(record.owner.subject())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| self.db_err(&e))?;
         }
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
     }
 
@@ -823,7 +827,7 @@ impl ResponseStore for PostgresResponseStore {
         }
         let rows = Box::pin(query.fetch_all(&self.pool))
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         rows.iter().map(row_to_pending_approval_record).collect()
     }
@@ -849,9 +853,7 @@ impl ResponseStore for PostgresResponseStore {
                AND response_id = $5 AND approval_id = $6 AND consumed_at IS NULL"
         );
 
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         // Lock rows in a deterministic (id-sorted) order so two concurrent
         // resumes overlapping in opposite order cannot deadlock (see trait doc);
@@ -868,16 +870,16 @@ impl ResponseStore for PostgresResponseStore {
                 .bind(approval_id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| self.db_err(&e))?;
             if result.rows_affected() == 0 {
                 // Already consumed by a prior request, or a duplicate earlier
                 // in this batch. Roll back so no id in the batch is claimed.
-                tx.rollback().await.map_err(|e| StoreError::Database(e.to_string()))?;
+                tx.rollback().await.map_err(|e| self.db_err(&e))?;
                 return Ok(Some(index));
             }
         }
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(None)
     }
 }
@@ -913,7 +915,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(owner.subject())
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -939,7 +941,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(owner.subject())
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -968,7 +970,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(&expected)
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -991,9 +993,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .as_deref()
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
 
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let sql = format!(
             "INSERT INTO {table} \
@@ -1019,7 +1019,7 @@ impl ConversationItemStore for PostgresResponseStore {
                 .bind(item.owner.subject())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| self.db_err(&e))?;
             if result.rows_affected() != 1 {
                 return Err(StoreError::Database(
                     "conversation item owner does not match its parent".to_owned(),
@@ -1027,7 +1027,7 @@ impl ConversationItemStore for PostgresResponseStore {
             }
         }
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
     }
 
@@ -1072,7 +1072,7 @@ impl ConversationItemStore for PostgresResponseStore {
                 .bind(i64::from(limit))
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?
+                .map_err(|e| self.db_err(&e))?
         } else {
             let sql = format!(
                 "SELECT item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position \
@@ -1089,7 +1089,7 @@ impl ConversationItemStore for PostgresResponseStore {
                 .bind(i64::from(limit))
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?
+                .map_err(|e| self.db_err(&e))?
         };
 
         rows.iter().map(row_to_conversation_item_record).collect()
@@ -1126,7 +1126,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(&ids)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))
+            .map_err(|e| self.db_err(&e))
     }
 
     async fn get_conversation_item(
@@ -1156,7 +1156,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         row.map(|r| row_to_conversation_item_record(&r)).transpose()
     }
@@ -1186,7 +1186,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -1217,9 +1217,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
-        row.map(|r| r.try_get("position").map_err(|e| StoreError::Database(e.to_string())))
+        row.map(|r| r.try_get("position").map_err(|e| self.db_err(&e)))
             .transpose()
     }
 
@@ -1243,9 +1243,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
-        row.try_get("max_pos").map_err(|e| StoreError::Database(e.to_string()))
+        row.try_get("max_pos").map_err(|e| self.db_err(&e))
     }
 
     async fn create_items_and_sync_messages(
@@ -1266,9 +1266,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
 
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
@@ -1282,7 +1280,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(owner.subject())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         let max_sql = format!(
             "SELECT COALESCE(MAX(position), 0) AS max_pos \
@@ -1296,10 +1294,8 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        let max_pos: i64 = max_row
-            .try_get("max_pos")
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
+        let max_pos: i64 = max_row.try_get("max_pos").map_err(|e| self.db_err(&e))?;
 
         let insert_sql = format!(
             "INSERT INTO {items_table} \
@@ -1323,12 +1319,12 @@ impl ConversationItemStore for PostgresResponseStore {
                 .bind(position)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| self.db_err(&e))?;
         }
 
         pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(())
     }
 
@@ -1345,9 +1341,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
         let conv_table = &self.tables.conversations;
 
-        let mut tx = Box::pin(self.pool.begin())
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let mut tx = Box::pin(self.pool.begin()).await.map_err(|e| self.db_err(&e))?;
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
@@ -1361,7 +1355,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(owner.subject())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \
@@ -1376,16 +1370,16 @@ impl ConversationItemStore for PostgresResponseStore {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
+            .map_err(|e| self.db_err(&e))?;
 
         if result.rows_affected() == 0 {
-            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            tx.commit().await.map_err(|e| self.db_err(&e))?;
             return Ok(false);
         }
 
         pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
 
-        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        tx.commit().await.map_err(|e| self.db_err(&e))?;
         Ok(true)
     }
 }
