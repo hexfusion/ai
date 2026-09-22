@@ -13,10 +13,10 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
-    ResponseStore, SslMode, StoreError,
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PoolConfig,
+    ResponseRecord, ResponseStore, SslMode, StoreError,
     compression::{StoreCompressionConfig, decode, run_blocking},
-    pool::{PoolConfig, apply_pool_config},
+    pool::apply_pool_config,
     postgres_tls::PgTlsConfig,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
@@ -26,15 +26,17 @@ use super::{
 };
 use crate::StateOwner;
 
-impl From<SslMode> for PgSslMode {
-    fn from(mode: SslMode) -> Self {
-        match mode {
-            SslMode::Disable => Self::Disable,
-            SslMode::Prefer => Self::Prefer,
-            SslMode::Require => Self::Require,
-            SslMode::VerifyCa => Self::VerifyCa,
-            SslMode::VerifyFull => Self::VerifyFull,
-        }
+/// Map the SQL-free [`SslMode`] onto sqlx's [`PgSslMode`].
+///
+/// A free function rather than a `From` impl: both types are now foreign to this
+/// crate, so the orphan rule forbids the trait impl.
+pub(crate) fn to_pg_ssl_mode(mode: SslMode) -> PgSslMode {
+    match mode {
+        SslMode::Disable => PgSslMode::Disable,
+        SslMode::Prefer => PgSslMode::Prefer,
+        SslMode::Require => PgSslMode::Require,
+        SslMode::VerifyCa => PgSslMode::VerifyCa,
+        SslMode::VerifyFull => PgSslMode::VerifyFull,
     }
 }
 
@@ -244,7 +246,7 @@ fn pg_connect_options(database_url: &str, tls: &PgTlsConfig<'_>) -> Result<PgCon
     };
 
     let effective_mode = tls.ssl_mode.unwrap_or_default();
-    options = options.ssl_mode(PgSslMode::from(effective_mode));
+    options = options.ssl_mode(to_pg_ssl_mode(effective_mode));
 
     if let Some(cert_path) = tls.ssl_root_cert {
         options = options.ssl_root_cert(Path::new(cert_path));

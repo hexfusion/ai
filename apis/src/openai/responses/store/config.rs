@@ -4,13 +4,14 @@
 //! Configuration types for the response store filter.
 
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
+use crate::store::StoreCompressionConfig;
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";

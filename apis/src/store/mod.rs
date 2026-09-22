@@ -43,7 +43,6 @@ pub(crate) mod postgres_url;
 mod schemas;
 #[cfg(feature = "store-sqlite")]
 mod sqlite;
-mod ssl_mode;
 
 #[cfg(test)]
 #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
@@ -68,8 +67,9 @@ pub use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, OwnerScopedStore as OwnerScopedResponseStore,
     PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, StoreError,
 };
-/// Validate response-store table identifiers.
-pub(crate) use schemas::validate_identifier as validate_table_identifier;
+// Table-name validation, pool tuning, and TLS mode live in the SQL-free
+// contract crate, re-exported here at their old paths.
+pub use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 #[cfg(feature = "store-postgres")]
 pub(crate) use schemas::validate_postgres_table_identifiers;
 #[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
@@ -81,11 +81,7 @@ pub use self::postgres::PostgresResponseStore;
 pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
-pub use self::{
-    compression::{CompressionAlgorithm, StoreCompressionConfig},
-    pool::PoolConfig,
-    ssl_mode::SslMode,
-};
+pub use self::compression::{CompressionAlgorithm, StoreCompressionConfig};
 use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
