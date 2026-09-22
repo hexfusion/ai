@@ -51,9 +51,12 @@ fn approval(id: &str) -> PendingApprovalRecord {
 /// Panics if the backend violates the persistence contract.
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     responses_are_owner_scoped(backend).await;
+    response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
+    persist_pairs_response_and_approvals(backend).await;
     conversation_messages_cas(backend).await;
     items_sync_positions_and_messages(backend).await;
+    item_writes_enforce_parent_scope(backend).await;
 }
 
 /// A response is visible only to its owner, and delete is scoped.
@@ -84,6 +87,43 @@ async fn responses_are_owner_scoped(backend: &dyn PersistedStateBackend) {
     assert!(
         backend.delete_response(&a, "resp_1").await.expect("delete a"),
         "owner delete failed"
+    );
+}
+
+/// A response id is globally unique: a colliding id owned by another principal
+/// is rejected, not overwritten.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn response_id_is_globally_unique(backend: &dyn PersistedStateBackend) {
+    let (a, b) = (owner("dup-a"), owner("dup-b"));
+    let base = ResponseRecord {
+        id: "resp_dup".to_owned(),
+        owner: a.clone(),
+        created_at: 1,
+        model: "m".to_owned(),
+        response_object: serde_json::json!({}),
+        input: serde_json::json!({}),
+        messages: serde_json::json!([]),
+    };
+    backend.upsert_response(&base).await.expect("first owner upsert");
+    backend
+        .upsert_response(&base)
+        .await
+        .expect("same-owner re-upsert must be allowed");
+    let collision = ResponseRecord {
+        owner: b.clone(),
+        ..base.clone()
+    };
+    assert!(
+        backend.upsert_response(&collision).await.is_err(),
+        "cross-owner id collision accepted"
+    );
+    assert!(
+        backend.get_response(&a, "resp_dup").await.expect("get a").is_some(),
+        "original owner's response lost after a rejected collision"
+    );
+    assert!(
+        backend.get_response(&b, "resp_dup").await.expect("get b").is_none(),
+        "collision leaked a row to the second owner"
     );
 }
 
@@ -145,6 +185,51 @@ async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
             .expect("consume a2"),
         None,
         "outstanding approval must survive an aborted batch"
+    );
+}
+
+/// `persist_response_with_pending_approvals` writes the response and its
+/// approvals together, and deleting the response takes its approvals with it.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn persist_pairs_response_and_approvals(backend: &dyn PersistedStateBackend) {
+    let o = owner("persist");
+    let record = ResponseRecord {
+        id: "resp_persist".to_owned(),
+        owner: o.clone(),
+        created_at: 1,
+        model: "m".to_owned(),
+        response_object: serde_json::json!({}),
+        input: serde_json::json!({}),
+        messages: serde_json::json!([]),
+    };
+    backend
+        .persist_response_with_pending_approvals(&record, &[approval("pa1")])
+        .await
+        .expect("persist response with approvals");
+    assert!(
+        backend.get_response(&o, "resp_persist").await.expect("get").is_some(),
+        "persisted response missing"
+    );
+    assert_eq!(
+        backend
+            .get_pending_approvals(&o, "resp_persist", &["pa1"])
+            .await
+            .expect("get approvals")
+            .len(),
+        1,
+        "persisted approval missing"
+    );
+    assert!(
+        backend.delete_response(&o, "resp_persist").await.expect("delete"),
+        "delete of the persisted response failed"
+    );
+    assert!(
+        backend
+            .get_pending_approvals(&o, "resp_persist", &["pa1"])
+            .await
+            .expect("get after delete")
+            .is_empty(),
+        "approval orphaned after its response was deleted"
     );
 }
 
@@ -243,6 +328,77 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         remaining.messages.as_array().map(Vec::len),
         Some(1),
         "message cache rebuilt after delete"
+    );
+}
+
+/// Item writes reject an orphan (no parent conversation), a cross-owner parent,
+/// and a duplicate id within one batch.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn item_writes_enforce_parent_scope(backend: &dyn PersistedStateBackend) {
+    let o = owner("scope");
+    let other = owner("scope-other");
+
+    // No parent conversation exists yet: both insert paths reject the orphan.
+    assert!(
+        backend
+            .create_conversation_items(&[item(&o, "conv_scope", "orphan_1")])
+            .await
+            .is_err(),
+        "orphan item accepted by create_conversation_items"
+    );
+    assert!(
+        backend
+            .create_items_and_sync_messages(&o, "conv_scope", &[item(&o, "conv_scope", "orphan_2")])
+            .await
+            .is_err(),
+        "orphan item accepted by create_items_and_sync_messages"
+    );
+
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_scope".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert conversation");
+
+    // An item owned by a different principal cannot attach to o's conversation.
+    assert!(
+        backend
+            .create_conversation_items(&[item(&other, "conv_scope", "mismatch_1")])
+            .await
+            .is_err(),
+        "cross-owner item accepted by create_conversation_items"
+    );
+    assert!(
+        backend
+            .create_items_and_sync_messages(&o, "conv_scope", &[item(&other, "conv_scope", "mismatch_2")])
+            .await
+            .is_err(),
+        "cross-owner item accepted by create_items_and_sync_messages"
+    );
+
+    // A duplicate id inside one batch is rejected on both paths.
+    assert!(
+        backend
+            .create_items_and_sync_messages(
+                &o,
+                "conv_scope",
+                &[item(&o, "conv_scope", "dup"), item(&o, "conv_scope", "dup")],
+            )
+            .await
+            .is_err(),
+        "intra-batch duplicate accepted by create_items_and_sync_messages"
+    );
+    assert!(
+        backend
+            .create_conversation_items(&[item(&o, "conv_scope", "dup2"), item(&o, "conv_scope", "dup2")])
+            .await
+            .is_err(),
+        "intra-batch duplicate accepted by create_conversation_items"
     );
 }
 

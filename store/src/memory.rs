@@ -41,8 +41,10 @@ struct StoredApproval {
 /// All in-memory state behind one mutex.
 #[derive(Default)]
 struct Inner {
-    /// `(owner, response_id)` -> response record.
-    responses: HashMap<OwnerKey, ResponseRecord>,
+    /// `response_id` -> response record, carrying its owner. Globally keyed
+    /// like the SQL `PRIMARY KEY (id)`, so a colliding id owned by another
+    /// principal is rejected rather than shadowed.
+    responses: HashMap<String, ResponseRecord>,
     /// `(owner, conversation_id)` -> conversation record.
     conversations: HashMap<OwnerKey, ConversationRecord>,
     /// `(owner, conversation_id)` -> its items (unordered; sorted on read).
@@ -82,24 +84,94 @@ fn rebuild_messages(items: &[ConversationItemRecord]) -> serde_json::Value {
     serde_json::Value::Array(sorted.into_iter().map(|item| item.item_data.clone()).collect())
 }
 
+/// Upsert a response, rejecting an id already owned by another principal.
+///
+/// Mirrors the SQL owner-guarded `ON CONFLICT (id)` upsert: a same-id write from
+/// a different owner fails instead of overwriting the existing row.
+fn upsert_response_into(inner: &mut Inner, record: &ResponseRecord) -> Result<(), StoreError> {
+    if let Some(existing) = inner.responses.get(&record.id)
+        && existing.owner != record.owner
+    {
+        return Err(StoreError::Database("response id collision".to_owned()));
+    }
+    inner.responses.insert(record.id.clone(), record.clone());
+    Ok(())
+}
+
+/// Reject a batch that reuses an item id, within itself or against stored rows.
+///
+/// Mirrors the SQL item `PRIMARY KEY (item_id)`, which is globally unique.
+fn reject_duplicate_item_ids(inner: &Inner, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+    for item in items {
+        if !seen.insert(item.item_id.as_str()) || inner.item_ids.contains(&item.item_id) {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation item '{}' already exists",
+                item.item_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject items that leave the authorized scope or whose parent is absent.
+///
+/// Mirrors the SQL `require_matching_item_scope` guard plus the rebuild update
+/// that matches no row when the conversation is gone.
+fn require_conversation_scope(
+    inner: &Inner,
+    owner: &StateOwner,
+    conversation_id: &str,
+    items: &[ConversationItemRecord],
+) -> Result<(), StoreError> {
+    if !items
+        .iter()
+        .all(|item| &item.owner == owner && item.conversation_id == conversation_id)
+    {
+        return Err(StoreError::InvalidInput(
+            "conversation item scope does not match its parent".to_owned(),
+        ));
+    }
+    if !inner
+        .conversations
+        .contains_key(&(owner.clone(), conversation_id.to_owned()))
+    {
+        return Err(StoreError::Database(format!(
+            "conversation disappeared during message sync: {conversation_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Record approvals insert-if-absent, so a re-emit never resets a consumed row.
+fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, records: &[PendingApprovalRecord]) {
+    for record in records {
+        let key = (owner.clone(), response_id.to_owned(), record.approval_id.clone());
+        inner.approvals.entry(key).or_insert_with(|| StoredApproval {
+            record: record.clone(),
+            consumed_at: None,
+        });
+    }
+}
+
 #[async_trait]
 impl ResponseStore for InMemoryStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
-        inner
-            .responses
-            .insert((record.owner.clone(), record.id.clone()), record.clone());
-        Ok(())
+        upsert_response_into(&mut inner, record)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         let inner = self.lock()?;
-        Ok(inner.responses.get(&(owner.clone(), id.to_owned())).cloned())
+        Ok(inner.responses.get(id).filter(|record| &record.owner == owner).cloned())
     }
 
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
-        let removed = inner.responses.remove(&(owner.clone(), id.to_owned())).is_some();
+        let removed = inner.responses.get(id).is_some_and(|record| &record.owner == owner);
+        if removed {
+            inner.responses.remove(id);
+        }
         // Deleting a response removes the pending approvals it issued, so no
         // consumable approval (and no tool arguments) survive it.
         inner
@@ -128,15 +200,21 @@ impl ResponseStore for InMemoryStore {
         _created_at: i64,
     ) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
-        for record in records {
-            let key = (owner.clone(), response_id.to_owned(), record.approval_id.clone());
-            // Insert-if-absent: never reset an already-recorded (possibly
-            // consumed) approval back to outstanding.
-            inner.approvals.entry(key).or_insert_with(|| StoredApproval {
-                record: record.clone(),
-                consumed_at: None,
-            });
-        }
+        record_approvals_into(&mut inner, owner, response_id, records);
+        Ok(())
+    }
+
+    async fn persist_response_with_pending_approvals(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<(), StoreError> {
+        // One lock spans the upsert and the approval writes so a concurrent
+        // delete cannot interleave and orphan an approval. The default
+        // sequential impl locks twice and leaves that window open.
+        let mut inner = self.lock()?;
+        upsert_response_into(&mut inner, record)?;
+        record_approvals_into(&mut inner, &record.owner, &record.id, pending_approvals);
         Ok(())
     }
 
@@ -289,13 +367,21 @@ impl ConversationItemStore for InMemoryStore {
 
     async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
+        // Validate the whole batch before mutating (all-or-nothing). The parent
+        // conversation must exist under the item's own owner, rejecting an
+        // orphan and a cross-owner parent alike.
         for item in items {
-            if inner.item_ids.contains(&item.item_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "conversation item '{}' already exists",
-                    item.item_id
-                )));
+            if !inner
+                .conversations
+                .contains_key(&(item.owner.clone(), item.conversation_id.clone()))
+            {
+                return Err(StoreError::InvalidInput(
+                    "conversation item scope does not match its parent".to_owned(),
+                ));
             }
+        }
+        reject_duplicate_item_ids(&inner, items)?;
+        for item in items {
             inner.item_ids.insert(item.item_id.clone());
             inner
                 .items
@@ -418,19 +504,13 @@ impl ConversationItemStore for InMemoryStore {
     ) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
         let key = (owner.clone(), conversation_id.to_owned());
+        require_conversation_scope(&inner, owner, conversation_id, items)?;
+        reject_duplicate_item_ids(&inner, items)?;
         let mut next = inner
             .items
             .get(&key)
             .and_then(|items| items.iter().map(|i| i.position).max())
             .unwrap_or(0);
-        for item in items {
-            if inner.item_ids.contains(&item.item_id) {
-                return Err(StoreError::InvalidInput(format!(
-                    "conversation item '{}' already exists",
-                    item.item_id
-                )));
-            }
-        }
         for item in items {
             next += 1;
             // Positions are assigned within the "transaction"; the input
@@ -616,6 +696,18 @@ mod tests {
         let store = InMemoryStore::new();
         let a = owner("a");
         let b = owner("b");
+        for (o, conversation_id) in [(&a, "c1"), (&b, "c2")] {
+            store
+                .upsert_conversation(&ConversationRecord {
+                    conversation_id: conversation_id.to_owned(),
+                    owner: o.clone(),
+                    created_at: 1,
+                    metadata: serde_json::json!({}),
+                    messages: serde_json::json!([]),
+                })
+                .await
+                .unwrap();
+        }
         store
             .create_conversation_items(&[item(&a, "c1", "shared", 1)])
             .await
