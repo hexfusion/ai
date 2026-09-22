@@ -55,7 +55,7 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    super::{DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, state::ResponsesState},
+    super::{DEFAULT_STORE_NAME, error::responses_error_rejection, state::ResponsesState},
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, validate_config},
     list_input_items,
@@ -64,8 +64,9 @@ use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
+    service::responses::ResponsesService,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
+    store::{PendingApprovalRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -105,12 +106,12 @@ impl ResponseStoreFilter {
         owner: &StateOwner,
         id: &str,
     ) -> Result<FilterAction, FilterError> {
-        let Some(store) = resolve_store(ctx, owner) else {
+        let Some(service) = resolve_service(ctx, owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
-        let deleted = store
-            .delete_response(id)
+        let deleted = service
+            .delete(id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
@@ -147,27 +148,19 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(owner) = capture.owner else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(store) = resolve_store(ctx, &owner) else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let request_input = capture.input;
-
-        // Capture the proxy-issued pending approvals before building the record;
-        // the borrow is released before `build_record_from_state` re-borrows ctx.
+        // Capture the proxy-issued pending approvals before taking the context.
         let pending_approvals = pending_approvals_from_ctx(ctx);
+        let (service, owner, request_input) = match take_persist_context(ctx) {
+            Ok(parts) => parts,
+            Err(action) => return Ok(action),
+        };
 
-        let Some(record) = build_record_from_state(ctx, owner, request_input) else {
-            trace!("skipping streaming persistence: no accumulated state");
+        let Some(record) = build_streaming_record(ctx, owner, request_input) else {
+            trace!("skipping streaming persistence: no persistable record");
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&store, &record, &pending_approvals)?;
+        persist_response_blocking(&service, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 
@@ -185,39 +178,91 @@ impl ResponseStoreFilter {
         if !store_available(ctx) {
             return Ok(FilterAction::Continue);
         }
-        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(owner) = capture.owner else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(store) = resolve_store(ctx, &owner) else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let request_input = capture.input;
-        let state_messages = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .map(|state| state.persisted_messages.clone());
+
+        // Capture the proxy-issued pending approvals before taking the context.
         let pending_approvals = pending_approvals_from_ctx(ctx);
-        let Some(record) = parse_response_record(bytes, owner, request_input, state_messages) else {
+        let (service, owner, request_input) = match take_persist_context(ctx) {
+            Ok(parts) => parts,
+            Err(action) => return Ok(action),
+        };
+
+        let Some(record) = build_buffered_record(ctx, bytes, owner, request_input) else {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(&store, &record, &pending_approvals)?;
+        persist_response_blocking(&service, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 }
 
-/// Resolve the owner-scoped default store from the per-request registry.
+/// Resolve the owner-scoped Responses service from the per-request registry.
 ///
-/// Mirrors the rehydrate filter: the store is provisioned into the registry on
-/// the serving runtime, and the filter takes an owner-bound handle at request
-/// time. `None` when no registry is installed or the store is not provisioned.
-fn resolve_store(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<OwnerScopedResponseStore> {
+/// The store is provisioned into the registry on the serving runtime; the filter
+/// takes an owner-bound handle at request time and wraps it in the service.
+/// `None` when no registry is installed or the store is not provisioned.
+fn resolve_service(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<ResponsesService> {
     ctx.extensions
         .get::<ResponseStoreRegistry>()
         .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, owner))
+        .map(ResponsesService::new)
+}
+
+/// Take the request-scoped persistence context captured before inference: the
+/// owner-scoped service, the immutable owner, and the original request input.
+/// `Err` carries the fail-closed rejection when the capture, owner, or store is
+/// missing.
+fn take_persist_context(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<(ResponsesService, StateOwner, Option<Value>), FilterAction> {
+    let capture = ctx
+        .extensions
+        .remove::<ResponseStoreRequestState>()
+        .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    let owner = capture
+        .owner
+        .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    let service = resolve_service(ctx, &owner).ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    Ok((service, owner, capture.input))
+}
+
+/// Build the streaming record from accumulated [`ResponsesState`]. `None` when no
+/// state was accumulated or the response is not persistable.
+fn build_streaming_record(
+    ctx: &HttpFilterContext<'_>,
+    owner: StateOwner,
+    request_input: Option<Value>,
+) -> Option<ResponseRecord> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let response_object = state.response_object.clone();
+    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
+    ResponsesService::build_record(response_object, owner, request_input, state_messages)
+}
+
+/// Build the buffered record from the decoded response body and the captured
+/// request state. `None` when the body is invalid JSON or not persistable.
+fn build_buffered_record(
+    ctx: &HttpFilterContext<'_>,
+    bytes: &[u8],
+    owner: StateOwner,
+    request_input: Option<Value>,
+) -> Option<ResponseRecord> {
+    let state_messages = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map(|state| state.persisted_messages.clone());
+    let json = decode_response_body(bytes)?;
+    ResponsesService::build_record(json, owner, request_input, state_messages)
+}
+
+/// Decode a buffered response body, logging and skipping on invalid JSON.
+fn decode_response_body(bytes: &[u8]) -> Option<Value> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            warn!(error = %e, "response store: invalid response JSON");
+            None
+        },
+    }
 }
 
 /// Whether the default store is provisioned into the per-request registry. The
@@ -262,28 +307,6 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
     ctx.extensions.insert(state);
 }
 
-/// Fields extracted from the response JSON for the store record.
-struct ResponseCapture {
-    /// Original request input used by rehydration.
-    input: Value,
-
-    /// Full message history used by rehydration.
-    messages: Value,
-}
-
-impl ResponseCapture {
-    /// Extract stored input and output from a Responses API exchange.
-    fn from_response_json(json: &Value, request_input: Option<Value>, state_messages: Option<Vec<Value>>) -> Self {
-        let input = request_input
-            .or_else(|| json.get("input").cloned())
-            .unwrap_or(Value::Null);
-        let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(history_input, json.get("output"));
-
-        Self { input, messages }
-    }
-}
-
 /// Extract the original Responses API request input from the buffered
 /// create request body.
 fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
@@ -296,21 +319,6 @@ fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
         },
     };
     json.as_object_mut()?.remove("input")
-}
-
-/// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
-    let mut messages = Vec::new();
-
-    append_stored_input_items(&mut messages, input);
-
-    match output {
-        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
-        Some(output) if !output.is_null() => messages.push(output.clone()),
-        Some(_) | None => {},
-    }
-
-    Value::Array(messages)
 }
 
 // -----------------------------------------------------------------------------
@@ -515,89 +523,10 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
     true
 }
 
-/// Parse a response body into a [`ResponseRecord`], returning
-/// `None` for invalid JSON or missing required fields.
-fn parse_response_record(
-    bytes: &[u8],
-    owner: StateOwner,
-    request_input: Option<Value>,
-    state_messages: Option<Vec<Value>>,
-) -> Option<ResponseRecord> {
-    let json: Value = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "response store: invalid response JSON");
-            return None;
-        },
-    };
-
-    let id = json.get("id").and_then(Value::as_str);
-    let created_at = json.get("created_at").and_then(Value::as_i64);
-    let model = json.get("model").and_then(Value::as_str);
-
-    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
-        warn!("response store: missing required field (id, created_at, or model)");
-        return None;
-    };
-
-    let capture = ResponseCapture::from_response_json(&json, request_input, state_messages);
-
-    Some(ResponseRecord {
-        id: id.to_owned(),
-        owner,
-        created_at,
-        model: model.to_owned(),
-        response_object: json,
-        input: capture.input,
-        messages: capture.messages,
-    })
-}
-
-/// Build a [`ResponseRecord`] from accumulated streaming state.
-///
-/// Reads `ResponsesState` from extensions. Returns `None` if the
-/// state is absent, `response_object` is null, or required fields
-/// are missing.
-pub(super) fn build_record_from_state(
-    ctx: &HttpFilterContext<'_>,
-    owner: StateOwner,
-    request_input: Option<Value>,
-) -> Option<ResponseRecord> {
-    let state = ctx.extensions.get::<ResponsesState>()?;
-
-    if state.response_object.is_null() {
-        warn!("streaming persistence: response_object is null (incomplete stream?)");
-        return None;
-    }
-
-    let json = &state.response_object;
-    let id = json.get("id").and_then(Value::as_str);
-    let created_at = json.get("created_at").and_then(Value::as_i64);
-    let model = json.get("model").and_then(Value::as_str);
-
-    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
-        warn!("streaming persistence: missing required field (id, created_at, or model)");
-        return None;
-    };
-
-    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
-    let capture = ResponseCapture::from_response_json(json, request_input, state_messages);
-
-    Some(ResponseRecord {
-        id: id.to_owned(),
-        owner,
-        created_at,
-        model: model.to_owned(),
-        response_object: json.clone(),
-        input: capture.input,
-        messages: capture.messages,
-    })
-}
-
 /// Persist a response record synchronously via [`block_in_place`].
 ///
 /// Uses the current Tokio runtime handle to drive the async
-/// `upsert_response` call without yielding back to Pingora's
+/// `persist` call without yielding back to Pingora's
 /// synchronous `response_body_filter`. This guarantees the record
 /// is durable before the response reaches the client, preventing
 /// races where a subsequent `DELETE /v1/responses/{id}` arrives
@@ -615,7 +544,7 @@ pub(super) fn build_record_from_state(
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
-    store: &OwnerScopedResponseStore,
+    service: &ResponsesService,
     record: &ResponseRecord,
     pending_approvals: &[PendingApprovalRecord],
 ) -> Result<(), FilterError> {
@@ -627,14 +556,8 @@ fn persist_response_blocking(
     );
 
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async {
-            store
-                .persist_response_with_pending_approvals(record, pending_approvals)
-                .await
-        })
-    })
-    .map_err(|e| -> FilterError { Box::new(e) })
+    tokio::task::block_in_place(|| handle.block_on(async { service.persist(record, pending_approvals).await }))
+        .map_err(|e| -> FilterError { Box::new(e) })
 }
 
 /// Snapshot the proxy-issued pending approvals from request-scoped state.
@@ -869,12 +792,12 @@ impl ResponseStoreFilter {
             Err(action) => return action,
         };
 
-        let Some(store) = resolve_store(ctx, owner) else {
+        let Some(service) = resolve_service(ctx, owner) else {
             return FilterAction::Reject(reject_store_error());
         };
         debug!(response_id = id, "retrieving stored response");
 
-        match store.get_response(id).await {
+        match service.get(id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -898,12 +821,12 @@ impl ResponseStoreFilter {
     /// [`FilterAction`] rejection on store or not-found errors.
     async fn load_record(&self, ctx: &HttpFilterContext<'_>, id: &str) -> Result<ResponseRecord, FilterAction> {
         let owner = require_state_owner(ctx)?;
-        let Some(store) = resolve_store(ctx, owner) else {
+        let Some(service) = resolve_service(ctx, owner) else {
             return Err(FilterAction::Reject(reject_store_error()));
         };
         debug!(response_id = id, "retrieving input items");
 
-        match store.get_response(id).await {
+        match service.get(id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");

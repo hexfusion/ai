@@ -19,7 +19,6 @@ use serde_json::json;
 use super::{
     ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
     config::{ResponseStoreConfig, validate_config},
-    input_items::DEFAULT_PAGE_LIMIT,
     list_input_items,
 };
 use crate::{
@@ -27,6 +26,7 @@ use crate::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
+    service::responses::input_items::DEFAULT_PAGE_LIMIT,
     store::{
         DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
         SqliteResponseStore,
@@ -752,31 +752,9 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     );
 }
 
-#[test]
-fn build_record_from_state_returns_none_for_null_response_object() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState::default());
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(result.is_none(), "should return None when response_object is null");
-}
-
-#[test]
-fn build_record_from_state_returns_none_for_missing_fields() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        response_object: json!({"id": "resp_1"}),
-        ..Default::default()
-    });
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(
-        result.is_none(),
-        "should return None when required fields (created_at, model) are missing"
-    );
-}
+// Record-assembly unit tests (null / missing-field / streaming-history cases)
+// moved to the service layer: `crate::service::responses` tests, where they run
+// against plain values with no pipeline or database.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_releases_when_skip_persist_is_true() {
@@ -1429,98 +1407,10 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
-#[test]
-fn streaming_record_uses_request_input_when_state_messages_are_empty() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let request_input = json!([{"role": "user", "content": "Captured streaming input"}]);
-    let response_json = json!({
-        "id": "resp_stream_no_state_messages",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "content": "Stored streaming output"}]
-    });
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json.clone(),
-        ..Default::default()
-    });
-
-    let record = super::filter::build_record_from_state(
-        &ctx,
-        crate::test_utils::test_owner("default"),
-        Some(request_input.clone()),
-    )
-    .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.input, request_input,
-        "stored input should come from the original streaming request"
-    );
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Captured streaming input"},
-            {"type": "message", "content": "Stored streaming output"}
-        ]),
-        "empty default ResponsesState messages should not hide request input"
-    );
-}
-
-#[test]
-fn streaming_record_preserves_mcp_metadata_from_persisted_messages() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let mcp_item = json!({
-        "id": "mcpl_1",
-        "type": "mcp_list_tools",
-        "server_label": "weather",
-        "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]
-    });
-    let response_json = json!({
-        "id": "resp_stream_mcp",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "role": "assistant", "content": "Next answer"}]
-    });
-
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json,
-        messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        persisted_messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            mcp_item.clone(),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        ..Default::default()
-    });
-
-    let request_input = json!([{"role": "user", "content": "What next?"}]);
-    let record =
-        super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), Some(request_input))
-            .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Hello"},
-            {"id": "mcpl_1", "type": "mcp_list_tools", "server_label": "weather",
-             "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]},
-            {"type": "message", "role": "assistant", "content": "Tools loaded"},
-            {"role": "user", "content": "What next?"},
-            {"type": "message", "role": "assistant", "content": "Next answer"}
-        ]),
-        "streaming record should preserve MCP metadata from persisted_messages, not drop it via messages"
-    );
-}
+// `streaming_record_uses_request_input_when_state_messages_are_empty` and
+// `streaming_record_preserves_mcp_metadata_from_persisted_messages` moved to the
+// service layer: `crate::service::responses` tests exercise `build_record`
+// directly against plain values.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_after_format_request_body_classification() {
