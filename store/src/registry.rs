@@ -16,7 +16,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
-    types::{ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
 
 /// Thread-safe registry of named persisted-state backends.
@@ -34,9 +34,9 @@ pub struct StoreRegistry {
 ///
 /// Request-driven consumers obtain this facade from [`StoreRegistry::get_scoped`]
 /// instead of the raw backend, so a later operation cannot substitute an
-/// arbitrary owner. Conversation-item scoped access is added with the
-/// conversations service extraction; today the facade exposes the response
-/// surface its callers use.
+/// arbitrary owner. The facade exposes both persisted-state capabilities: the
+/// Responses surface and the conversation-lifecycle and item surface, each
+/// bound to the same validated owner.
 #[derive(Clone)]
 pub struct OwnerScopedStore {
     /// Shared combined backend hidden behind the owner-bound facade.
@@ -115,6 +115,201 @@ impl OwnerScopedStore {
     ) -> Result<Option<usize>, StoreError> {
         self.store
             .consume_approvals(&self.owner, response_id, approval_ids, consumed_at)
+            .await
+    }
+
+    /// Persist a conversation only when its immutable owner matches this handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store.upsert_conversation(record).await
+    }
+
+    /// Update only this owner's conversation message cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn update_conversation_messages(
+        &self,
+        conversation_id: &str,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .update_conversation_messages(&self.owner, conversation_id, messages)
+            .await
+    }
+
+    /// Update only this owner's conversation metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn update_conversation_metadata(
+        &self,
+        conversation_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .update_conversation_metadata(&self.owner, conversation_id, metadata)
+            .await
+    }
+
+    /// Compare-and-swap this owner's conversation message cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn compare_and_swap_conversation_messages(
+        &self,
+        conversation_id: &str,
+        expected_messages: &serde_json::Value,
+        messages: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .compare_and_swap_conversation_messages(&self.owner, conversation_id, expected_messages, messages)
+            .await
+    }
+
+    /// Delete a conversation visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_conversation(&self, conversation_id: &str) -> Result<bool, StoreError> {
+        self.store.delete_conversation(&self.owner, conversation_id).await
+    }
+
+    /// Insert conversation items, each of which must carry this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store.create_conversation_items(items).await
+    }
+
+    /// List a conversation's items visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn list_conversation_items(
+        &self,
+        conversation_id: &str,
+        after_item_id: Option<&str>,
+        limit: u32,
+        ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        self.store
+            .list_conversation_items(&self.owner, conversation_id, after_item_id, limit, ascending)
+            .await
+    }
+
+    /// Return the subset of `item_ids` already present for this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn get_existing_conversation_item_ids(
+        &self,
+        conversation_id: &str,
+        item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        self.store
+            .get_existing_conversation_item_ids(&self.owner, conversation_id, item_ids)
+            .await
+    }
+
+    /// Retrieve a single conversation item visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn get_conversation_item(
+        &self,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        self.store
+            .get_conversation_item(&self.owner, conversation_id, item_id)
+            .await
+    }
+
+    /// Delete a single conversation item visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_conversation_item(&self, conversation_id: &str, item_id: &str) -> Result<bool, StoreError> {
+        self.store
+            .delete_conversation_item(&self.owner, conversation_id, item_id)
+            .await
+    }
+
+    /// Look up an item's position within this owner's conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn conversation_item_position(
+        &self,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.store
+            .conversation_item_position(&self.owner, conversation_id, item_id)
+            .await
+    }
+
+    /// Return the maximum item position in this owner's conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn max_item_position(&self, conversation_id: &str) -> Result<i64, StoreError> {
+        self.store.max_item_position(&self.owner, conversation_id).await
+    }
+
+    /// Atomically insert items and rebuild this owner's message cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn create_items_and_sync_messages(
+        &self,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store
+            .create_items_and_sync_messages(&self.owner, conversation_id, items)
+            .await
+    }
+
+    /// Atomically delete an item and rebuild this owner's message cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_item_and_sync_messages(
+        &self,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .delete_item_and_sync_messages(&self.owner, conversation_id, item_id)
             .await
     }
 
