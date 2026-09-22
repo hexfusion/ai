@@ -4,7 +4,7 @@
 //! Concrete store-backend factories and connection-error redaction.
 //!
 //! The factories wrap the existing SQL backends (still in apis pre-#1260) as
-//! [`StoreBackendFactory`] implementations the lifecycle layer provisions. They
+//! [`praxis_ai_store::StoreBackendFactory`] implementations the lifecycle layer provisions. They
 //! own the backend-specific config, classify a build failure so the cache
 //! applies the tested policy (SQLite permanent-init failure is unavailable;
 //! Postgres transient connect is retryable), compute the dedup key, and close
