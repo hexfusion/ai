@@ -90,7 +90,7 @@ container-run: | require-container-engine
 # -------------------------------------------------------------------
 
 test:
-	cargo test --workspace $(_NOCAPTURE)
+	cargo test --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) $(_NOCAPTURE)
 
 test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
