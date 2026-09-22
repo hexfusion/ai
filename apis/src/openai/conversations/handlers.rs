@@ -6,6 +6,10 @@
 use std::{borrow::Cow, fmt, marker::PhantomData};
 
 use percent_encoding::percent_decode_str;
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+use praxis_ai_store::ConversationItemStore;
+use praxis_ai_store::{ConversationItemRecord, ConversationRecord, StoreError};
 use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
 use serde::{
     Deserializer as _, Serialize,
@@ -25,17 +29,16 @@ use super::{
     },
     validate::{MetadataError, validate_metadata},
 };
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+use crate::state_owner::StateOwner;
 use crate::{
     openai::{
         include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
         responses::store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
     },
     service::conversations::{ConversationsService, build_item_records, duplicate_item_id, validate_item_count},
-    store::{ConversationItemRecord, ConversationRecord, StoreError},
 };
-#[cfg(test)]
-#[cfg(feature = "store-sqlite")]
-use crate::{state_owner::StateOwner, store::ConversationItemStore};
 
 // -----------------------------------------------------------------------------
 // Constants
