@@ -89,6 +89,26 @@ pub use self::provisioning::store_backend_factories;
 pub use self::sqlite::SqliteResponseStore;
 use crate::StateOwner;
 
+/// Scrub a connection string, and any credentials embedded in it, from an error
+/// message before it reaches [`StoreError::Database`] or a log line.
+///
+/// The SQL backends carry their configured URL so a runtime query error redacts
+/// it here, matching the connect-time redaction the provisioning factories apply.
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
+    let base = message.replace(url, "<redacted database url>");
+    // Best effort for a `scheme://user:pass@host` credential echoed separately
+    // from the full url: drop the userinfo segment. split_once avoids byte
+    // indexing, which could split a UTF-8 character.
+    let Some((before, rest)) = base.split_once("://") else {
+        return base;
+    };
+    match rest.split_once('@') {
+        Some((_userinfo, after_at)) => format!("{before}://<redacted credentials>@{after_at}"),
+        None => format!("{before}://{rest}"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // ResponseStoreRegistry
 // -----------------------------------------------------------------------------

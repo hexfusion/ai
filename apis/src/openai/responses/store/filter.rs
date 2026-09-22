@@ -11,9 +11,10 @@
 //! persist?" decision as new information becomes available:
 //!
 //! - **`on_request`**: reads classifier metadata to decide whether the request needs the store (persistable POST or
-//!   `previous_response_id`). Lazily initializes the store backend when needed. Rejects with a 500 response on store
-//!   init failure for any request that requires the store (persistence or rehydration). `GET` and `DELETE` endpoints
-//!   owned by the store also reject rather than falling through to the upstream.
+//!   `previous_response_id`). Resolves the store from the per-request registry, which the serving runtime provisions.
+//!   Rejects with a 500 response when a request that requires the store (persistence or rehydration) finds none
+//!   provisioned. `GET` and `DELETE` endpoints owned by the store also reject rather than falling through to the
+//!   upstream.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -43,8 +44,6 @@
 //! [`filter_metadata`]: praxis_filter::HttpFilterContext::filter_metadata
 //! [`ResponsesState`]: super::super::state::ResponsesState
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -52,33 +51,21 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-use secrecy::ExposeSecret as _;
 use serde_json::Value;
-use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "store-postgres")]
-use super::config::revalidate_postgres_host;
 use super::{
-    super::{
-        DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, is_explicit_compact_request,
-        state::ResponsesState,
-    },
+    super::{DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, state::ResponsesState},
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
-    config::{ResponseStoreConfig, StorageBackend, validate_config},
+    config::{ResponseStoreConfig, validate_config},
     list_input_items,
 };
-#[cfg(feature = "store-postgres")]
-use crate::store::PostgresResponseStore;
-#[cfg(feature = "store-sqlite")]
-use crate::store::SqliteResponseStore;
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     state_owner::{StateOwner, require_state_owner},
-    store::{PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStoreRegistry, StoreError},
+    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -93,17 +80,14 @@ use crate::{
 /// conversations_table: openai_conversation_messages
 /// allow_private_database_url: true
 /// ```
-pub struct ResponseStoreFilter {
-    /// Parsed configuration.
-    pub(crate) config: ResponseStoreConfig,
-
-    /// Lazily initialized store backend. SQLite init failures are cached
-    /// as `None`; Postgres init failures are retried on every code path.
-    pub(crate) store: OnceCell<Option<Arc<dyn PersistedStateBackend>>>,
-}
+pub struct ResponseStoreFilter;
 
 impl ResponseStoreFilter {
     /// Create a filter from parsed YAML config.
+    ///
+    /// The config is validated here so a malformed or unknown-backend config
+    /// fails at pipeline construction. The serving-runtime provisioner opens the
+    /// backend and registers it; the filter only resolves it at request time.
     ///
     /// # Errors
     ///
@@ -111,147 +95,22 @@ impl ResponseStoreFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", config)?;
         validate_config(&cfg)?;
-        Ok(Box::new(Self::new(cfg)))
-    }
-
-    /// Create a filter from validated config.
-    pub(super) fn new(config: ResponseStoreConfig) -> Self {
-        Self {
-            config,
-            store: OnceCell::new(),
-        }
-    }
-
-    /// Build the configured store backend.
-    #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
-    #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
-        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
-    )]
-    pub(super) async fn build_store(&self) -> Result<Arc<dyn PersistedStateBackend>, StoreError> {
-        match self.config.backend {
-            #[cfg(feature = "store-sqlite")]
-            StorageBackend::Sqlite => {
-                let store = SqliteResponseStore::new(
-                    self.config.database_url.expose_secret(),
-                    &self.config.responses_table,
-                    &self.config.conversations_table,
-                    None,
-                    self.config.pool.as_ref(),
-                    self.config.compression.as_ref(),
-                )
-                .await;
-                store.map(|s| {
-                    let arc: Arc<dyn PersistedStateBackend> = Arc::new(s);
-                    arc
-                })
-            },
-            #[cfg(not(feature = "store-sqlite"))]
-            StorageBackend::Sqlite => Err(StoreError::Unavailable(
-                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
-            )),
-            #[cfg(feature = "store-postgres")]
-            StorageBackend::Postgres => {
-                revalidate_postgres_host(&self.config).map_err(|e| {
-                    StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
-                })?;
-                let tls = self.config.tls_config();
-                let store = Box::pin(PostgresResponseStore::new(
-                    self.config.database_url.expose_secret(),
-                    &self.config.responses_table,
-                    &self.config.conversations_table,
-                    None,
-                    &tls,
-                    self.config.pool.as_ref(),
-                    self.config.compression.as_ref(),
-                ))
-                .await;
-                store.map(|s| {
-                    let arc: Arc<dyn PersistedStateBackend> = Arc::new(s);
-                    arc
-                })
-            },
-            #[cfg(not(feature = "store-postgres"))]
-            StorageBackend::Postgres => Err(StoreError::Unavailable(
-                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
-            )),
-        }
-    }
-
-    /// Build the store and log successful initialization.
-    async fn build_logged_store(&self) -> Result<Arc<dyn PersistedStateBackend>, StoreError> {
-        let store = Box::pin(self.build_store()).await?;
-        debug!(
-            backend = ?self.config.backend,
-            responses_table = %self.config.responses_table,
-            conversations_table = %self.config.conversations_table,
-            "response store initialized"
-        );
-        Ok(store)
-    }
-
-    /// Initialize a store once, caching failed init permanently.
-    async fn init_permanent_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
-        match Box::pin(self.build_logged_store()).await {
-            Ok(store) => Some(store),
-            Err(e) => {
-                warn!(
-                    backend = ?self.config.backend,
-                    error = %e,
-                    "response store initialization failed (permanent)"
-                );
-                None
-            },
-        }
-    }
-
-    /// Return the initialized store, retrying transient Postgres failures.
-    async fn get_or_init_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
-        if matches!(self.config.backend, StorageBackend::Postgres) {
-            match self
-                .store
-                .get_or_try_init(|| async { Box::pin(self.build_logged_store()).await.map(Some) })
-                .await
-            {
-                Ok(store) => store.as_ref().map(Arc::clone),
-                Err(e) => {
-                    warn!(
-                        backend = ?self.config.backend,
-                        error = %e,
-                        "response store initialization failed (will retry)"
-                    );
-                    None
-                },
-            }
-        } else {
-            self.store
-                .get_or_init(|| async { Box::pin(self.init_permanent_store()).await })
-                .await
-                .as_ref()
-                .map(Arc::clone)
-        }
-    }
-
-    /// Best-effort store init for the explicit compact endpoint.
-    ///
-    /// The compact filter handles a missing store with its own error,
-    /// so a failed init here does not reject the request.
-    async fn try_init_store_for_compact(&self, ctx: &HttpFilterContext<'_>) {
-        if is_explicit_compact_request(ctx)
-            && let Some(store) = &self.get_or_init_store().await
-        {
-            register_store_in_context(ctx, store);
-        }
+        Ok(Box::new(Self))
     }
 
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
-    async fn handle_delete(&self, owner: &StateOwner, id: &str) -> Result<FilterAction, FilterError> {
-        let Some(store) = self.ensure_store().await else {
+    async fn handle_delete(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        owner: &StateOwner,
+        id: &str,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(store) = resolve_store(ctx, owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
         let deleted = store
-            .delete_response(owner, id)
+            .delete_response(id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
@@ -266,28 +125,12 @@ impl ResponseStoreFilter {
 
     /// Return whether this exchange should release response body
     /// chunks immediately instead of waiting for EOS.
-    fn should_release_skipped_response_body(&self, ctx: &HttpFilterContext<'_>) -> bool {
-        should_skip_persist(ctx) || self.store.get().and_then(Option::as_ref).is_none()
-    }
-
-    /// Return the initialized store and terminal response bytes.
-    fn terminal_store_and_body<'a>(
-        &self,
-        ctx: &HttpFilterContext<'_>,
-        body: &'a Option<Bytes>,
-    ) -> Option<(&dyn PersistedStateBackend, &'a Bytes)> {
-        if should_skip_persist(ctx) {
-            return None;
-        }
-
-        let store = self.store.get().and_then(Option::as_deref)?;
-        let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-
-        Some((store, bytes))
+    fn should_release_skipped_response_body(ctx: &HttpFilterContext<'_>) -> bool {
+        should_skip_persist(ctx) || !store_available(ctx)
     }
 
     /// Persist a streaming response from accumulated `ResponsesState`.
-    fn persist_from_streaming_state(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    fn persist_from_streaming_state(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -299,15 +142,18 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(store) = self.store.get().and_then(Option::as_deref) else {
+        if !store_available(ctx) {
             trace!("skipping streaming persistence: store unavailable");
             return Ok(FilterAction::Continue);
-        };
+        }
 
         let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
         let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(store) = resolve_store(ctx, &owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
         let request_input = capture.input;
@@ -321,23 +167,31 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record, &pending_approvals)?;
+        persist_response_blocking(&store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 
     /// Persist a non-streaming response from the buffered body bytes.
     fn persist_from_buffered_body(
-        &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
-        let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
+        if should_skip_persist(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
             return Ok(FilterAction::Continue);
         };
+        if !store_available(ctx) {
+            return Ok(FilterAction::Continue);
+        }
         let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
         let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(store) = resolve_store(ctx, &owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
         let request_input = capture.input;
@@ -350,9 +204,29 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record, &pending_approvals)?;
+        persist_response_blocking(&store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
+}
+
+/// Resolve the owner-scoped default store from the per-request registry.
+///
+/// Mirrors the rehydrate filter: the store is provisioned into the registry on
+/// the serving runtime, and the filter takes an owner-bound handle at request
+/// time. `None` when no registry is installed or the store is not provisioned.
+fn resolve_store(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<OwnerScopedResponseStore> {
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, owner))
+}
+
+/// Whether the default store is provisioned into the per-request registry. The
+/// owner-scoped read needs an owner, so a presence check that does not have one
+/// (release decision, pre-persist gate) uses this instead.
+fn store_available(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .is_some_and(|registry| registry.contains(DEFAULT_STORE_NAME))
 }
 
 // -----------------------------------------------------------------------------
@@ -453,40 +327,22 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 }
 
 // -----------------------------------------------------------------------------
-// Registry Helpers
+// Persistence Arming
 // -----------------------------------------------------------------------------
-
-/// Publish the initialized store into the per-request registry so
-/// downstream filters (rehydrate, compact, etc.) can read from it.
-fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn PersistedStateBackend>) {
-    let Some(registry) = ctx.extensions.get::<ResponseStoreRegistry>() else {
-        return;
-    };
-    // The response store is intentionally instance-scoped today: a Praxis
-    // process has one default Responses store shared by listener pipelines.
-    // If multi-store-per-instance support is added later, this registry key
-    // must become config- or listener-scoped instead of "default".
-    if registry.contains(DEFAULT_STORE_NAME) {
-        return;
-    }
-    let name: Arc<str> = Arc::from(DEFAULT_STORE_NAME);
-    if let Err(e) = registry.register(&name, Arc::clone(store)) {
-        debug!(error = %e, "response store already registered");
-    }
-}
 
 /// Mark this exchange as persistence-armed on the shared [`ResponsesState`].
 ///
 /// This is the exchange-scoped signal `mcp_dispatch` requires before emitting an
-/// `mcp_approval_request`. It is set only when this store filter both registers a
-/// backend and classifies the request as one whose response it will persist, so
-/// — unlike pipeline-scoped registry membership — it proves persistence is armed
-/// for THIS exchange and catches a store filter that is absent,
-/// request-conditioned out, or ordered after dispatch.
+/// `mcp_approval_request`. It is set only when the request classifies as one
+/// whose response this filter will persist, so, unlike pipeline-scoped registry
+/// membership, it proves persistence is armed for THIS exchange and catches a
+/// store filter that is absent, request-conditioned out, or ordered after
+/// dispatch.
 ///
 /// It is written from `on_request_body` because `openai_responses_validate`
 /// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
-/// the same body phase; `ResponsesState` is not yet present during `on_request`.
+/// the same body phase, so `ResponsesState` is not yet present during
+/// `on_request`.
 fn arm_persistence_if_persisting(ctx: &mut HttpFilterContext<'_>) {
     if request_will_persist_response(ctx)
         && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
@@ -759,7 +615,7 @@ pub(super) fn build_record_from_state(
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
-    store: &dyn PersistedStateBackend,
+    store: &OwnerScopedResponseStore,
     record: &ResponseRecord,
     pending_approvals: &[PendingApprovalRecord],
 ) -> Result<(), FilterError> {
@@ -824,10 +680,6 @@ impl HttpFilter for ResponseStoreFilter {
         BodyMode::Stream
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "request routing and pre-inference owner capture remain one lifecycle hook"
-    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -848,7 +700,7 @@ impl HttpFilter for ResponseStoreFilter {
                     Ok(owner) => owner.clone(),
                     Err(action) => return Ok(action),
                 };
-                return self.handle_delete(&owner, id).await;
+                return self.handle_delete(ctx, &owner, id).await;
             }
             return Ok(FilterAction::Continue);
         }
@@ -857,22 +709,15 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(action);
         }
 
-        if !should_init_store_for_request(ctx) {
-            self.try_init_store_for_compact(ctx).await;
-            return Ok(FilterAction::Continue);
-        }
-
-        match &self.get_or_init_store().await {
-            Some(store) => register_store_in_context(ctx, store),
-            None => return Ok(FilterAction::Reject(reject_store_error())),
+        // A persistable or rehydrating request needs the provisioned store; fail
+        // fast (before inference) when it is absent rather than at response time.
+        if should_init_store_for_request(ctx) && !store_available(ctx) {
+            return Ok(FilterAction::Reject(reject_store_error()));
         }
 
         Ok(FilterAction::Continue)
     }
 
-    /// Eagerly register the store during the body phase so
-    /// downstream filters running in `StreamBuffer` pre-read
-    /// (before `on_request`) can access it.
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -891,17 +736,14 @@ impl HttpFilter for ResponseStoreFilter {
             capture_request_input(ctx, input);
         }
         if should_init_store_for_request(ctx) {
-            match &self.get_or_init_store().await {
-                Some(store) => register_store_in_context(ctx, store),
-                None => return Ok(FilterAction::Reject(reject_store_error())),
+            if !store_available(ctx) {
+                return Ok(FilterAction::Reject(reject_store_error()));
             }
             // Publish the exchange-scoped persistence-armed marker so a
             // downstream approval pause (mcp_dispatch) can tell that THIS
-            // response will be persisted, not merely that a store is registered
+            // response will be persisted, not merely that a store is provisioned
             // somewhere in the pipeline.
             arm_persistence_if_persisting(ctx);
-        } else {
-            self.try_init_store_for_compact(ctx).await;
         }
         Ok(FilterAction::Continue)
     }
@@ -915,7 +757,7 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if self.get_or_init_store().await.is_none() {
+        if !store_available(ctx) {
             return Ok(FilterAction::Reject(reject_store_error()));
         }
 
@@ -930,7 +772,7 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if self.should_release_skipped_response_body(ctx) {
+        if Self::should_release_skipped_response_body(ctx) {
             return Ok(FilterAction::Release);
         }
 
@@ -952,7 +794,7 @@ impl HttpFilter for ResponseStoreFilter {
                     // state is missing (#1197), or an `Err` on a persistence
                     // failure — and must be propagated so the client never
                     // observes `response.completed` for an unpersisted record.
-                    match self.persist_from_streaming_state(ctx)? {
+                    match Self::persist_from_streaming_state(ctx)? {
                         FilterAction::Continue => {},
                         action => return Ok(action),
                     }
@@ -968,14 +810,14 @@ impl HttpFilter for ResponseStoreFilter {
             if streaming_terminal_emitted(ctx) {
                 return Ok(FilterAction::Continue);
             }
-            return self.persist_from_streaming_state(ctx);
+            return Self::persist_from_streaming_state(ctx);
         }
 
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
-        self.persist_from_buffered_body(ctx, body)
+        Self::persist_from_buffered_body(ctx, body)
     }
 }
 
@@ -1007,11 +849,6 @@ impl ResponseStoreFilter {
         Ok(None)
     }
 
-    /// Lazily initialize the store and return a clone of the `Arc`.
-    async fn ensure_store(&self) -> Option<Arc<dyn PersistedStateBackend>> {
-        self.get_or_init_store().await
-    }
-
     /// Serve `GET /v1/responses/{id}`.
     #[expect(
         clippy::cognitive_complexity,
@@ -1027,17 +864,17 @@ impl ResponseStoreFilter {
             return FilterAction::Reject(reject_invalid_input(&msg));
         }
 
-        let Some(store) = self.ensure_store().await else {
-            return FilterAction::Reject(reject_store_error());
-        };
-
         let owner = match require_state_owner(ctx) {
             Ok(owner) => owner,
             Err(action) => return action,
         };
+
+        let Some(store) = resolve_store(ctx, owner) else {
+            return FilterAction::Reject(reject_store_error());
+        };
         debug!(response_id = id, "retrieving stored response");
 
-        match store.get_response(owner, id).await {
+        match store.get_response(id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -1060,14 +897,13 @@ impl ResponseStoreFilter {
     /// Load a [`ResponseRecord`] from the store, returning a
     /// [`FilterAction`] rejection on store or not-found errors.
     async fn load_record(&self, ctx: &HttpFilterContext<'_>, id: &str) -> Result<ResponseRecord, FilterAction> {
-        let Some(store) = self.ensure_store().await else {
+        let owner = require_state_owner(ctx)?;
+        let Some(store) = resolve_store(ctx, owner) else {
             return Err(FilterAction::Reject(reject_store_error()));
         };
-
-        let owner = require_state_owner(ctx)?;
         debug!(response_id = id, "retrieving input items");
 
-        match store.get_response(owner, id).await {
+        match store.get_response(id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");
