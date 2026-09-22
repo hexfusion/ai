@@ -11,4 +11,6 @@
 //!
 //! Internal and unstable: a first-party workspace layer, not an external API.
 
+#[cfg(feature = "openai-conversations")]
+pub(crate) mod conversations;
 pub(crate) mod responses;
