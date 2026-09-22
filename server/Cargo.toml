@@ -73,6 +73,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 clap = { workspace = true }
+http = { workspace = true }
 notify = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-filters = { workspace = true }

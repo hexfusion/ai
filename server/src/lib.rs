@@ -4,6 +4,8 @@
 //! Server bootstrap for Praxis AI.
 
 pub(crate) mod pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub mod readiness;
 pub(crate) mod reload;
 mod server;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
