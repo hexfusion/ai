@@ -16,7 +16,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use pingora_core::{server::ShutdownWatch, services::background::BackgroundService};
 use praxis_ai_apis::store::{
-    DEFAULT_STORE_NAME, RESPONSE_STORE_FILTER_NAME, ResponseStoreRegistry, store_backend_factories,
+    CONVERSATIONS_STORE_FILTER_NAME, CONVERSATIONS_STORE_NAME, DEFAULT_STORE_NAME, RESPONSE_STORE_FILTER_NAME,
+    ResponseStoreRegistry, conversations_store_ref_config, store_backend_factories,
 };
 use praxis_ai_store::StoreRegistry;
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
@@ -100,12 +101,12 @@ struct ListenerStorePlan {
     refs: Vec<StoreRef>,
 }
 
-/// Build one store reference from a response-store filter's config.
+/// Build the response-store reference from a response-store filter's config.
 ///
 /// The `backend` field selects the factory. The rest is the inline config the
 /// factory parses. Returns `None` for a config missing a string `backend` or one
 /// that cannot map to JSON.
-fn store_ref_from_config(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
+fn response_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
     let backend = filter_config.get("backend").and_then(serde_yaml::Value::as_str)?;
     let mut config = serde_json::to_value(filter_config).ok()?;
     config.as_object_mut()?.remove("backend");
@@ -116,16 +117,37 @@ fn store_ref_from_config(filter_config: &serde_yaml::Value) -> Option<StoreRef> 
     })
 }
 
-/// Find the first response-store filter reachable from `entries`, following
+/// Build the conversations-store reference from a conversations filter's config.
+///
+/// The apis layer owns the table defaults and the generated (unused)
+/// responses-table name the combined backend requires. The store is registered
+/// under its own name; the lifecycle cache still shares one backend with the
+/// response store when their effective configs match.
+fn conversations_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
+    match conversations_store_ref_config(filter_config) {
+        Ok((backend_id, config)) => Some(StoreRef {
+            name: Arc::from(CONVERSATIONS_STORE_NAME),
+            backend_id: Arc::from(backend_id.as_str()),
+            config,
+        }),
+        Err(e) => {
+            error!(error = %e, "conversations store config could not be prepared for provisioning");
+            None
+        },
+    }
+}
+
+/// Find the first filter of `filter_type` reachable from `entries`, following
 /// inline and named branch chains so a store configured only inside a branch is
 /// provisioned too. `visited` guards against a named-chain cycle.
 fn find_store_filter<'a>(
     entries: &'a [FilterEntry],
     chains: &HashMap<&str, &'a [FilterEntry]>,
+    filter_type: &str,
     visited: &mut std::collections::HashSet<String>,
 ) -> Option<&'a FilterEntry> {
     for entry in entries {
-        if entry.filter_type == RESPONSE_STORE_FILTER_NAME {
+        if entry.filter_type == filter_type {
             return Some(entry);
         }
         let Some(branches) = entry.branch_chains.as_ref() else {
@@ -142,7 +164,7 @@ fn find_store_filter<'a>(
                     }
                 },
             };
-            if let Some(found) = find_store_filter(nested, chains, visited) {
+            if let Some(found) = find_store_filter(nested, chains, filter_type, visited) {
                 return Some(found);
             }
         }
@@ -150,9 +172,29 @@ fn find_store_filter<'a>(
     None
 }
 
+/// Find `filter_type` across a listener's chains, following branch chains. Each
+/// store is instance-scoped to one name, so the first match across the chains wins.
+fn find_listener_store_filter<'a>(
+    listener: &praxis_core::config::Listener,
+    chains: &HashMap<&str, &'a [FilterEntry]>,
+    filter_type: &str,
+) -> Option<&'a FilterEntry> {
+    let mut visited = std::collections::HashSet::new();
+    for name in &listener.filter_chains {
+        visited.insert(name.clone());
+        let Some(filters) = chains.get(name.as_str()).copied() else {
+            continue;
+        };
+        if let Some(entry) = find_store_filter(filters, chains, filter_type, &mut visited) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 /// Build a per-listener store plan for every listener whose chains configure a
-/// response store. The store is instance-scoped to one default name, so the
-/// first store filter in a listener's chains wins.
+/// response or conversations store. Each store is instance-scoped to one name,
+/// so the first filter of each type in a listener's chains wins.
 fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
     let chains: HashMap<&str, &[FilterEntry]> = config
         .filter_chains
@@ -162,23 +204,22 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
 
     let mut plans = Vec::new();
     for listener in &config.listeners {
-        let mut visited = std::collections::HashSet::new();
-        let mut store_ref = None;
-        for name in &listener.filter_chains {
-            visited.insert(name.clone());
-            let Some(filters) = chains.get(name.as_str()).copied() else {
-                continue;
-            };
-            if let Some(entry) = find_store_filter(filters, &chains, &mut visited) {
-                store_ref = store_ref_from_config(&entry.config);
-                break;
-            }
+        let mut refs = Vec::new();
+        if let Some(store_ref) = find_listener_store_filter(listener, &chains, RESPONSE_STORE_FILTER_NAME)
+            .and_then(|entry| response_store_ref(&entry.config))
+        {
+            refs.push(store_ref);
         }
-        if let Some(store_ref) = store_ref {
+        if let Some(store_ref) = find_listener_store_filter(listener, &chains, CONVERSATIONS_STORE_FILTER_NAME)
+            .and_then(|entry| conversations_store_ref(&entry.config))
+        {
+            refs.push(store_ref);
+        }
+        if !refs.is_empty() {
             plans.push(ListenerStorePlan {
                 listener: listener.name.clone(),
                 registry: StoreRegistry::new(),
-                refs: vec![store_ref],
+                refs,
             });
         }
     }
@@ -266,7 +307,7 @@ impl StoreProvisionService {
                 // leak a half-opened pool. Only the backoff waits under select!.
                 match self.cache.provision_into(&plan.refs, &plan.registry).await {
                     Ok(lease) => {
-                        info!(listener = %plan.listener, "response store provisioned");
+                        info!(listener = %plan.listener, "persisted-state stores provisioned");
                         leases.push(lease);
                         break;
                     },
@@ -319,7 +360,7 @@ impl BackgroundService for StoreProvisionService {
         // see a partially provisioned instance as ready.
         if self.provision_all(&mut leases, &mut shutdown).await {
             let _sent = self.readiness.send(StoreReadiness::Ready);
-            info!("all response stores provisioned");
+            info!("all persisted-state stores provisioned");
             let _changed = shutdown.changed().await;
         }
         // Hold the leases so the backends outlive pipeline swaps, then release on
