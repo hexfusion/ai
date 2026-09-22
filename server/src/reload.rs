@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "store")]
-use praxis_ai_apis::store::RESPONSE_STORE_FILTER_NAME;
+use praxis_ai_apis::store::{CONVERSATIONS_STORE_FILTER_NAME, RESPONSE_STORE_FILTER_NAME};
 use praxis_core::{
     config::Config,
     health::{HealthRegistry, build_health_registry},
@@ -196,14 +196,15 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_subrequest_connector_changes(old, new);
 }
 
-/// Collect the response-store filter configs across all chains, for comparison.
+/// Collect the response-store and conversations-store filter configs across all
+/// chains, for comparison.
 #[cfg(feature = "store")]
 fn store_filter_configs(config: &Config) -> Vec<&serde_yaml::Value> {
     config
         .filter_chains
         .iter()
         .flat_map(|c| c.filters.iter())
-        .filter(|e| e.filter_type == RESPONSE_STORE_FILTER_NAME)
+        .filter(|e| e.filter_type == RESPONSE_STORE_FILTER_NAME || e.filter_type == CONVERSATIONS_STORE_FILTER_NAME)
         .map(|e| &e.config)
         .collect()
 }

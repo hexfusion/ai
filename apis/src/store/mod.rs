@@ -129,8 +129,14 @@ impl From<StoreRegistry> for ResponseStoreRegistry {
 }
 
 /// Registry name of the process-default response store.
+pub use crate::openai::conversations::{CONVERSATIONS_STORE_NAME, store_ref_config as conversations_store_ref_config};
 pub use crate::openai::responses::DEFAULT_STORE_NAME;
 
 /// Filter type that configures the response store. The serving runtime scans
 /// filter chains for this type to provision the backends the store filter reads.
 pub const RESPONSE_STORE_FILTER_NAME: &str = "openai_response_store";
+
+/// Filter type that configures the conversations store. The serving runtime
+/// scans filter chains for this type to provision the conversations backend the
+/// conversations filter reads.
+pub const CONVERSATIONS_STORE_FILTER_NAME: &str = "openai_conversations";
