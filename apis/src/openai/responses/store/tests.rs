@@ -972,7 +972,7 @@ async fn armed_streaming_ctx<'a>(
 async fn streaming_terminal_frame_persists_before_eos_release() {
     let filter = make_filter();
     let store = Arc::new(RecordingResponseStore::new(false));
-    let store_dyn: Arc<dyn PersistedStateBackend> = store.clone();
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_terminal", true).await;
@@ -1019,7 +1019,7 @@ async fn streaming_terminal_frame_persists_before_eos_release() {
 async fn streaming_terminal_frame_persist_failure_fails_closed() {
     let filter = make_filter();
     let store = Arc::new(RecordingResponseStore::new(true));
-    let store_dyn: Arc<dyn PersistedStateBackend> = store.clone();
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_failclosed", true).await;
@@ -1053,7 +1053,7 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
     // (owner + input) is captured; streaming persistence then fails closed.
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let store_dyn: Arc<dyn PersistedStateBackend> = store.clone();
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
     install_recording_store(&mut ctx, store_dyn);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
@@ -1089,7 +1089,7 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
 async fn streaming_without_terminal_signal_persists_only_at_eos() {
     let filter = make_filter();
     let store = Arc::new(RecordingResponseStore::new(false));
-    let store_dyn: Arc<dyn PersistedStateBackend> = store.clone();
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     // No terminal frame observed through this filter (e.g. a plain single-round
@@ -5600,9 +5600,16 @@ fn make_filter() -> ResponseStoreFilter {
 /// installed into a request context, mirroring serving-runtime provisioning.
 async fn empty_registry() -> (ResponseStoreRegistry, Arc<dyn PersistedStateBackend>) {
     let store: Arc<dyn PersistedStateBackend> = Arc::new(
-        SqliteResponseStore::new("sqlite::memory:", "test_responses", "test_conversations", None, None)
-            .await
-            .expect("in-memory sqlite store should build"),
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("in-memory sqlite store should build"),
     );
     let registry = ResponseStoreRegistry::new();
     registry
@@ -5657,7 +5664,7 @@ fn cleanup_sqlite_file(db_path: &PathBuf) {
 /// separately for verification observes the same rows.
 async fn file_store_registry(db_url: &str) -> ResponseStoreRegistry {
     let store: Arc<dyn PersistedStateBackend> = Arc::new(
-        SqliteResponseStore::new(db_url, "test_responses", "test_conversations", None, None)
+        SqliteResponseStore::new(db_url, "test_responses", "test_conversations", None, None, None)
             .await
             .expect("file-backed sqlite store should build"),
     );

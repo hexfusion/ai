@@ -3651,6 +3651,7 @@ dependencies = [
  "http 1.5.0",
  "nix",
  "notify",
+ "praxis-ai-apis",
  "praxis-ai-build-support",
  "praxis-ai-filters",
  "praxis-ai-llmd-ext-proc",

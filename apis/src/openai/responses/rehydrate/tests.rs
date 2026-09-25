@@ -347,7 +347,7 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
     // The store is provisioned into the registry outside the filter; back it by
     // the same file the previous response was seeded into so rehydrate finds it.
-    let provisioned = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let provisioned = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     let store_registry = ResponseStoreRegistry::new();
