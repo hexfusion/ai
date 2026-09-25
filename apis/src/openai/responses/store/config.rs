@@ -9,9 +9,9 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use crate::store::StoreCompressionConfig;
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::StoreCompressionConfig;
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
