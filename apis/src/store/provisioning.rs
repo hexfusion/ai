@@ -510,6 +510,7 @@ mod postgres_tests {
     fn validate_accepts_client_cert_mtls_config() {
         let cfg = json!({
             "database_url": "postgres://svc@db.example.com:5432/app",
+            "allow_private_database_url": true,
             "responses_table": "responses",
             "conversations_table": "conversations",
             "ssl_mode": "verify-full",
@@ -528,15 +529,20 @@ mod postgres_tests {
     fn validate_rejects_client_cert_with_unverified_ssl_mode() {
         let cfg = json!({
             "database_url": "postgres://svc@db.example.com:5432/app",
+            "allow_private_database_url": true,
             "responses_table": "responses",
             "conversations_table": "conversations",
             "ssl_mode": "require",
             "ssl_client_cert": "/etc/pki/client.pem",
             "ssl_client_key": "/etc/pki/client.key",
         });
-        PostgresBackendFactory
+        let err = PostgresBackendFactory
             .validate_config(&cfg)
-            .expect_err("a client cert under an unverified ssl_mode must be rejected");
+            .expect_err("a client cert under an unverified ssl_mode must be rejected")
+            .to_string();
+        // Assert the ssl_mode reason, so allowing the DNS host cannot let this
+        // pass for the wrong reason.
+        assert!(err.contains("verify-ca") && err.contains("verify-full"), "got: {err}");
     }
 
     /// A different client-certificate path is a different connection identity,
