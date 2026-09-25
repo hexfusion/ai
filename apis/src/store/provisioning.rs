@@ -315,6 +315,12 @@ mod postgres {
         fn validate_config(&self, config: &Value) -> Result<(), BackendError> {
             let cfg = Self::parse(config)?;
             let url = cfg.database_url.expose_secret();
+            // Run the SSRF-sensitive host check at construction so a private or
+            // loopback host fails fatally at startup rather than passing here and
+            // failing later in async provisioning, where the permanent error
+            // would otherwise loop with readiness stuck at failed.
+            postgres_url::revalidate_postgres_host(BACKEND_ID, url, cfg.allow_private_database_url)
+                .map_err(|e| BackendError::Config(e.to_string()))?;
             let paths = cfg.tls_paths();
             let tls = cfg.tls_config(&paths);
             // Run the filter's fail-closed TLS/auth check at pipeline construction.

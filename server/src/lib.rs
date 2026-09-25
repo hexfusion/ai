@@ -32,6 +32,11 @@ pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_ap
 #[derive(Clone, Default)]
 pub(crate) struct StoreRegistries(std::marker::PhantomData<()>);
 
+/// A shared, swappable handle to the current cluster health registry. Reload
+/// stores a freshly built registry here so the readiness endpoint reads current
+/// cluster health rather than the snapshot captured at startup.
+pub(crate) type SharedHealthRegistry = std::sync::Arc<std::sync::Mutex<praxis_core::health::HealthRegistry>>;
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------

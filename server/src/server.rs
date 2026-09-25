@@ -109,8 +109,6 @@ fn boot_server(
     info!("initializing server");
     let mut server = PingoraServerRuntime::new(&config);
     let _cert_shutdowns = register_protocols(&mut server, &config, &state.pipelines);
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    let health_registry_for_readiness = Arc::clone(&health_registry);
     register_admin_endpoints(&mut server, &config, health_registry, &state.kv_stores);
 
     // Provision response-store backends on the serving runtime, before run().
@@ -125,7 +123,7 @@ fn boot_server(
         register_store_readiness_endpoint(
             &mut server,
             state.store_readiness.clone(),
-            health_registry_for_readiness,
+            Arc::clone(&state.health_slot),
         );
     }
 
@@ -153,6 +151,9 @@ struct ServerState {
     /// Per-listener response-store registries, threaded through reloads so a
     /// reloaded pipeline keeps the serving-runtime-provisioned backends.
     store_registries: crate::StoreRegistries,
+    /// Shared handle to the current cluster health registry, updated on reload so
+    /// the readiness endpoint never reads a stale startup snapshot.
+    health_slot: crate::SharedHealthRegistry,
     /// Serving-runtime store provisioner, taken by `boot_server` and registered
     /// as a Pingora background service before the server runs.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
@@ -206,12 +207,15 @@ fn build_server_state(
     let _circuit_eviction =
         spawn_circuit_eviction_if_configured(config, &subrequest_client, &circuit_eviction_shutdown);
 
+    let health_slot = Arc::new(Mutex::new(Arc::clone(health_registry)));
+
     ServerState {
         pipelines: Arc::new(pipelines),
         kv_stores,
         subrequest_client,
         health_shutdown,
         store_registries,
+        health_slot,
         #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
         store_service,
         #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
@@ -266,6 +270,7 @@ fn spawn_watcher(
         shutdown: CancellationToken::new(),
         subrequest_client: state.subrequest_client,
         store_registries: state.store_registries,
+        health_slot: state.health_slot,
     });
     Some(handle)
 }
@@ -307,13 +312,13 @@ fn register_admin_endpoints(
 fn register_store_readiness_endpoint(
     server: &mut PingoraServerRuntime,
     readiness: crate::store_provision::StoreReadinessHandle,
-    health_registry: HealthRegistry,
+    health: crate::SharedHealthRegistry,
 ) {
     if std::env::var(crate::readiness::READINESS_ADDR_ENV).is_err() {
         return;
     }
     let addr = crate::readiness::readiness_addr();
-    let app = crate::readiness::StoreReadinessService::new(readiness, Some(health_registry));
+    let app = crate::readiness::StoreReadinessService::new(readiness, health);
     let mut service = pingora_core::services::listening::Service::new("store-readiness".to_owned(), app);
     service.add_tcp(&addr);
     info!(address = %addr, path = crate::readiness::READINESS_PATH, "store readiness endpoint enabled");
