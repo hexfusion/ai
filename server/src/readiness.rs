@@ -15,7 +15,6 @@
 use async_trait::async_trait;
 use http::{Response, StatusCode, header};
 use pingora_core::{apps::http_app::ServeHttp, protocols::http::ServerSession};
-use praxis_core::health::HealthRegistry;
 use praxis_protocol::http::pingora::health::PingoraHealthService;
 
 use crate::store_provision::{StoreReadiness, StoreReadinessHandle};
@@ -56,23 +55,22 @@ fn compose_readiness(store: StoreReadiness, cluster_ready: bool) -> (u16, String
 pub struct StoreReadinessService {
     /// Store-provisioning readiness, shared with the provisioning service.
     readiness: StoreReadinessHandle,
-    /// Cluster-health source, reused for its readiness verdict.
-    cluster: PingoraHealthService,
+    /// Shared cluster-health registry, read live so a reload's replacement is
+    /// reflected instead of a startup snapshot.
+    health: crate::SharedHealthRegistry,
 }
 
 impl StoreReadinessService {
     /// Build the service over the store handle and the cluster health registry.
     #[must_use]
-    pub fn new(readiness: StoreReadinessHandle, health_registry: Option<HealthRegistry>) -> Self {
-        Self {
-            readiness,
-            cluster: PingoraHealthService::new(health_registry, false),
-        }
+    pub fn new(readiness: StoreReadinessHandle, health: crate::SharedHealthRegistry) -> Self {
+        Self { readiness, health }
     }
 
     /// The current readiness verdict.
     fn verdict(&self) -> (u16, String) {
-        let cluster_ready = self.cluster.ready_response().0 == 200;
+        let current = std::sync::Arc::clone(&self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let cluster_ready = PingoraHealthService::new(Some(current), false).ready_response().0 == 200;
         compose_readiness(self.readiness.current(), cluster_ready)
     }
 }
