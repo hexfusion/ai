@@ -71,6 +71,7 @@ WORKDIR /src
 # (--locked) and the report stage can run `cargo xtask fips`. The legal files
 # are for the runtime stage (Apache-2.0 section 4).
 COPY Cargo.toml Cargo.lock LICENSE NOTICE ./
+COPY store store
 COPY apis apis
 COPY filters filters
 COPY server server
