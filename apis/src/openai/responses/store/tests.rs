@@ -17,8 +17,9 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::{
-    DEFAULT_PAGE_LIMIT, ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
     config::{ResponseStoreConfig, validate_config},
+    input_items::DEFAULT_PAGE_LIMIT,
     list_input_items,
 };
 use crate::{
@@ -1648,6 +1649,8 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    // Provision the store the registry-only filter resolves at request time.
+    ctx.extensions.insert(file_store_registry(&db_url).await);
     let request_json = json!({
         "model": "gpt-4.1",
         "input": [{"role": "user", "content": "Hello"}]

@@ -159,9 +159,11 @@ const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// harness serves requests. Generous enough for a Postgres pool (and its TLS
 /// handshake) to open under coverage instrumentation. A permanent provisioning
 /// failure falls through so the test's own assertion reports it.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 const STORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between store-readiness polls.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 const STORE_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Harness store-provisioning readiness waiter.
