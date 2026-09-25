@@ -20,6 +20,18 @@ pub use server::{
 };
 pub use subrequest::create_subrequest_client;
 
+/// Per-listener response-store registries threaded through serve, reload, and
+/// pipeline resolution. The real map only when the store feature is on; a unit
+/// placeholder otherwise, so the serve and watch signatures stay feature-free.
+#[cfg(feature = "store")]
+pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>;
+/// Feature-off placeholder for [`StoreRegistries`], so serve and watch keep
+/// feature-free signatures. Not a unit struct and not `Copy`, so it trips no
+/// lint when defaulted or passed by reference.
+#[cfg(not(feature = "store"))]
+#[derive(Clone, Default)]
+pub(crate) struct StoreRegistries(std::marker::PhantomData<()>);
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
