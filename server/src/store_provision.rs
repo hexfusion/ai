@@ -20,7 +20,7 @@ use praxis_ai_apis::store::{
 };
 use praxis_ai_store::StoreRegistry;
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
-use praxis_core::config::Config;
+use praxis_core::config::{ChainRef, Config, FilterEntry};
 use tokio::sync::watch;
 use tracing::{error, info};
 
@@ -116,11 +116,45 @@ fn store_ref_from_config(filter_config: &serde_yaml::Value) -> Option<StoreRef> 
     })
 }
 
+/// Find the first response-store filter reachable from `entries`, following
+/// inline and named branch chains so a store configured only inside a branch is
+/// provisioned too. `visited` guards against a named-chain cycle.
+fn find_store_filter<'a>(
+    entries: &'a [FilterEntry],
+    chains: &HashMap<&str, &'a [FilterEntry]>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<&'a FilterEntry> {
+    for entry in entries {
+        if entry.filter_type == RESPONSE_STORE_FILTER_NAME {
+            return Some(entry);
+        }
+        let Some(branches) = entry.branch_chains.as_ref() else {
+            continue;
+        };
+        for chain in branches.iter().flat_map(|branch| branch.chains.iter()) {
+            let nested = match chain {
+                ChainRef::Inline { filters, .. } => filters.as_slice(),
+                ChainRef::Named(name) => {
+                    if visited.insert(name.clone()) {
+                        chains.get(name.as_str()).copied().unwrap_or_default()
+                    } else {
+                        &[]
+                    }
+                },
+            };
+            if let Some(found) = find_store_filter(nested, chains, visited) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// Build a per-listener store plan for every listener whose chains configure a
 /// response store. The store is instance-scoped to one default name, so the
 /// first store filter in a listener's chains wins.
 fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
-    let chains: HashMap<&str, &[_]> = config
+    let chains: HashMap<&str, &[FilterEntry]> = config
         .filter_chains
         .iter()
         .map(|c| (c.name.as_str(), c.filters.as_slice()))
@@ -128,13 +162,18 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
 
     let mut plans = Vec::new();
     for listener in &config.listeners {
-        let store_ref = listener
-            .filter_chains
-            .iter()
-            .filter_map(|name| chains.get(name.as_str()))
-            .flat_map(|filters| filters.iter())
-            .find(|entry| entry.filter_type == RESPONSE_STORE_FILTER_NAME)
-            .and_then(|entry| store_ref_from_config(&entry.config));
+        let mut visited = std::collections::HashSet::new();
+        let mut store_ref = None;
+        for name in &listener.filter_chains {
+            visited.insert(name.clone());
+            let Some(filters) = chains.get(name.as_str()).copied() else {
+                continue;
+            };
+            if let Some(entry) = find_store_filter(filters, &chains, &mut visited) {
+                store_ref = store_ref_from_config(&entry.config);
+                break;
+            }
+        }
         if let Some(store_ref) = store_ref {
             plans.push(ListenerStorePlan {
                 listener: listener.name.clone(),
@@ -213,6 +252,11 @@ impl StoreProvisionService {
     /// so a transient database or TLS failure self-heals. Returns `false` when
     /// shutdown interrupts a retry. Acquired leases are pushed onto `leases` so
     /// the caller releases them regardless of outcome.
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "per-listener retry loop with permanent-vs-transient classification and backoff"
+    )]
     async fn provision_all(&self, leases: &mut Vec<BackendLease>, shutdown: &mut ShutdownWatch) -> bool {
         for plan in &self.plans {
             let mut backoff = PROVISION_RETRY_INITIAL;
@@ -229,6 +273,25 @@ impl StoreProvisionService {
                     Err(e) => {
                         // Non-Ready until a later attempt succeeds.
                         let _sent = self.readiness.send(StoreReadiness::Failed);
+                        // A config error never self-heals (bad host, invalid TLS,
+                        // unusable table names), so stop rather than retry forever.
+                        // Readiness stays failed so an operator sees a 503 instead
+                        // of an instance that loops silently returning 500s.
+                        if matches!(
+                            e,
+                            ProvisionError::UnknownBackend { .. }
+                                | ProvisionError::Backend {
+                                    source: praxis_ai_store::BackendError::Config(_),
+                                    ..
+                                }
+                        ) {
+                            error!(
+                                listener = %plan.listener,
+                                error = %e,
+                                "response store provisioning failed permanently; not retrying",
+                            );
+                            return false;
+                        }
                         error!(
                             listener = %plan.listener,
                             error = %e,

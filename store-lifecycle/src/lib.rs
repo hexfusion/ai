@@ -182,6 +182,10 @@ impl BackendCache {
     ///
     /// Same as [`provision`]. References already provisioned in this call are
     /// released on error so no refcount leaks.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "resolve-and-register loop plus rollback on either failure path"
+    )]
     pub async fn provision_into(
         &self,
         refs: &[StoreRef],
@@ -189,22 +193,33 @@ impl BackendCache {
     ) -> Result<BackendLease, ProvisionError> {
         let mut held: Vec<CacheKey> = Vec::new();
         let mut this_gen: HashSet<CacheKey> = HashSet::new();
+        // Names registered in this call, deregistered on error so a later
+        // reference's failure leaves the registry as it was, not with earlier
+        // entries that make a retry fail as a duplicate.
+        let mut registered: Vec<Arc<str>> = Vec::new();
 
         for r in refs {
             let backend = match self.resolve(r, &mut this_gen, &mut held).await {
                 Ok(backend) => backend,
                 Err(e) => {
+                    for name in &registered {
+                        registry.deregister(name);
+                    }
                     release_into(&self.entries, &held).await;
                     return Err(e);
                 },
             };
             if registry.register(&r.name, backend).is_err() {
+                for name in &registered {
+                    registry.deregister(name);
+                }
                 release_into(&self.entries, &held).await;
                 return Err(ProvisionError::Backend {
                     name: Arc::clone(&r.name),
                     source: BackendError::Config(format!("duplicate store name '{}'", r.name)),
                 });
             }
+            registered.push(Arc::clone(&r.name));
         }
 
         Ok(BackendLease {

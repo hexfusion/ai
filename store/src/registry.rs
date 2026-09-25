@@ -371,6 +371,12 @@ impl StoreRegistry {
         }
     }
 
+    /// Remove a named backend, rolling back a partially provisioned attempt so a
+    /// later reference's failure does not leave earlier entries registered.
+    pub fn deregister(&self, name: &str) {
+        self.stores.remove(name);
+    }
+
     /// Look up a backend by name and bind all request-driven access to `owner`.
     #[must_use]
     pub fn get_scoped(&self, name: &str, owner: &StateOwner) -> Option<OwnerScopedStore> {

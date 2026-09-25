@@ -68,6 +68,10 @@ pub(crate) struct WatcherParams {
     /// Per-listener response-store registries, reused so a reloaded pipeline
     /// keeps the serving-runtime-provisioned backends.
     pub(crate) store_registries: crate::StoreRegistries,
+
+    /// Shared cluster-health registry, updated on reload so the readiness
+    /// endpoint reads current health rather than the startup snapshot.
+    pub(crate) health_slot: crate::SharedHealthRegistry,
 }
 
 // -----------------------------------------------------------------------------
@@ -130,6 +134,7 @@ async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
                     &params.kv_stores,
                     &params.subrequest_client,
                     &params.store_registries,
+                    &params.health_slot,
                 );
             }
             () = params.shutdown.cancelled() => {
@@ -155,6 +160,7 @@ fn handle_reload(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
     store_registries: &crate::StoreRegistries,
+    health_slot: &crate::SharedHealthRegistry,
 ) {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -189,6 +195,7 @@ fn handle_reload(
         kv_stores,
         subrequest_client,
         store_registries,
+        health_slot,
     ) {
         Ok(()) => {
             *current_config = new_config;
@@ -319,6 +326,7 @@ mod tests {
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
             store_registries: crate::StoreRegistries::default(),
+            health_slot: crate::SharedHealthRegistry::default(),
         });
 
         std::thread::sleep(Duration::from_millis(100));
@@ -355,6 +363,7 @@ mod tests {
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
             store_registries: crate::StoreRegistries::default(),
+            health_slot: crate::SharedHealthRegistry::default(),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -399,6 +408,7 @@ mod tests {
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
             store_registries: crate::StoreRegistries::default(),
+            health_slot: crate::SharedHealthRegistry::default(),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -472,6 +482,7 @@ mod tests {
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
             store_registries: crate::StoreRegistries::default(),
+            health_slot: crate::SharedHealthRegistry::default(),
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
