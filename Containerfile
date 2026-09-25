@@ -31,6 +31,7 @@ WORKDIR /src
 
 # Workspace manifests
 COPY Cargo.toml Cargo.lock ./
+COPY store/Cargo.toml ./store/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
@@ -77,6 +78,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # crates recompile; all external dependencies are cached.
 # build_support/src was already real (see above), so it is not
 # copied again here.
+COPY store/src ./store/src
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
