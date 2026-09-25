@@ -55,7 +55,8 @@ pub fn resolve_pipelines(
 /// Same as [`resolve_pipelines`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "threads config, registries, shared services, and per-listener stores"
+    clippy::too_many_lines,
+    reason = "threads config, registries, shared services, per-listener stores, and the policy-connector setup"
 )]
 pub(crate) fn resolve_pipelines_with_stores(
     config: &Config,
@@ -66,7 +67,6 @@ pub(crate) fn resolve_pipelines_with_stores(
     store_registries: &HashMap<String, ResponseStoreRegistry>,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
-
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
