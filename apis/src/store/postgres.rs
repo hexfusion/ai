@@ -30,7 +30,7 @@ use crate::StateOwner;
 ///
 /// A free function rather than a `From` impl: both types are now foreign to this
 /// crate, so the orphan rule forbids the trait impl.
-pub(crate) fn to_pg_ssl_mode(mode: SslMode) -> PgSslMode {
+pub fn to_pg_ssl_mode(mode: SslMode) -> PgSslMode {
     match mode {
         SslMode::Disable => PgSslMode::Disable,
         SslMode::Prefer => PgSslMode::Prefer,
