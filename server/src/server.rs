@@ -4,12 +4,10 @@
 //! Server bootstrap: protocol registration and startup.
 
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use praxis_ai_apis::store::ResponseStoreRegistry;
 use praxis_core::{
     PingoraServerRuntime,
     config::{Config, ProtocolKind},
@@ -20,10 +18,7 @@ use praxis_protocol::{CertWatcherShutdowns, ListenerPipelines, Protocol as _, ht
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::{
-    pipelines::resolve_pipelines_with_stores,
-    subrequest::{create_subrequest_client, spawn_circuit_eviction_if_configured},
-};
+use crate::subrequest::{create_subrequest_client, spawn_circuit_eviction_if_configured};
 
 // -----------------------------------------------------------------------------
 // Config Path Resolution
@@ -91,10 +86,7 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
 /// config watcher, and run.
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
-#[cfg_attr(
-    any(feature = "store-postgres", feature = "store-sqlite"),
-    expect(clippy::too_many_lines, reason = "store provisioning and readiness registration")
-)]
+#[expect(clippy::too_many_lines, reason = "store provisioning and readiness registration")]
 fn boot_server(
     config: Config,
     registry: FilterRegistry,
@@ -160,7 +152,7 @@ struct ServerState {
     health_shutdown: Arc<Mutex<CancellationToken>>,
     /// Per-listener response-store registries, threaded through reloads so a
     /// reloaded pipeline keeps the serving-runtime-provisioned backends.
-    store_registries: HashMap<String, ResponseStoreRegistry>,
+    store_registries: crate::StoreRegistries,
     /// Serving-runtime store provisioner, taken by `boot_server` and registered
     /// as a Pingora background service before the server runs.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
@@ -172,12 +164,9 @@ struct ServerState {
 }
 
 /// Build filter pipelines, health checks, and registries.
-#[cfg_attr(
-    any(feature = "store-postgres", feature = "store-sqlite"),
-    expect(
-        clippy::too_many_lines,
-        reason = "store wiring adds registry, provisioner, and readiness"
-    )
+#[expect(
+    clippy::too_many_lines,
+    reason = "store wiring adds registry, provisioner, and readiness"
 )]
 fn build_server_state(
     config: &Config,
@@ -192,9 +181,10 @@ fn build_server_state(
     let (store_registries, store_service, store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
     #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
-    let store_registries: HashMap<String, ResponseStoreRegistry> = HashMap::new();
+    let store_registries = crate::StoreRegistries::default();
 
-    let pipelines = resolve_pipelines_with_stores(
+    #[cfg(feature = "store")]
+    let pipelines = crate::pipelines::resolve_pipelines_with_stores(
         config,
         registry,
         health_registry,
@@ -203,6 +193,10 @@ fn build_server_state(
         &store_registries,
     )
     .unwrap_or_else(|e| fatal(&e));
+    #[cfg(not(feature = "store"))]
+    let pipelines =
+        crate::pipelines::resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
+            .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);

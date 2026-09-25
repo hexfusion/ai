@@ -67,7 +67,7 @@ pub(crate) struct WatcherParams {
 
     /// Per-listener response-store registries, reused so a reloaded pipeline
     /// keeps the serving-runtime-provisioned backends.
-    pub(crate) store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>,
+    pub(crate) store_registries: crate::StoreRegistries,
 }
 
 // -----------------------------------------------------------------------------
@@ -154,7 +154,7 @@ fn handle_reload(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
-    store_registries: &std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>,
+    store_registries: &crate::StoreRegistries,
 ) {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -318,7 +318,7 @@ mod tests {
             registry,
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: std::collections::HashMap::new(),
+            store_registries: crate::StoreRegistries::default(),
         });
 
         std::thread::sleep(Duration::from_millis(100));
@@ -354,7 +354,7 @@ mod tests {
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: std::collections::HashMap::new(),
+            store_registries: crate::StoreRegistries::default(),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -398,7 +398,7 @@ mod tests {
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: std::collections::HashMap::new(),
+            store_registries: crate::StoreRegistries::default(),
         });
 
         std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
@@ -471,7 +471,7 @@ mod tests {
             registry,
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: std::collections::HashMap::new(),
+            store_registries: crate::StoreRegistries::default(),
         });
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
