@@ -95,9 +95,8 @@ impl PostgresResponseStore {
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "distinct connection, table-name, TLS, pool, and compression inputs are clearer passed explicitly than bundled"
+        reason = "distinct connection, table-name, TLS, pool, and compression inputs are clearer passed explicitly than bundled; schema setup plus the retained URL inflate the body"
     )]
-    #[expect(clippy::too_many_lines, reason = "schema setup plus the retained connection URL")]
     pub async fn new(
         database_url: &str,
         responses_table: &str,

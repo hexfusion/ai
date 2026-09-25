@@ -42,6 +42,12 @@ fn pool_fingerprint(pool: Option<&crate::store::PoolConfig>) -> String {
     )
 }
 
+/// A stable fingerprint of the compression override for the dedup key.
+#[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+fn compression_fingerprint(compression: Option<&crate::store::StoreCompressionConfig>) -> String {
+    compression.map_or_else(|| "none".to_owned(), |c| format!("{:?}/{:?}", c.algorithm, c.level))
+}
+
 /// SQLite-backed store-backend factory.
 #[cfg(feature = "store-sqlite")]
 mod sqlite {
@@ -54,7 +60,7 @@ mod sqlite {
     use serde_json::Value;
 
     use super::{BackendError, permanent};
-    use crate::store::{PoolConfig, SqliteResponseStore};
+    use crate::store::{PoolConfig, SqliteResponseStore, StoreCompressionConfig};
 
     /// Backend id the SQLite factory answers to.
     pub(crate) const BACKEND_ID: &str = "sqlite";
@@ -75,6 +81,9 @@ mod sqlite {
         /// Optional connection-pool overrides.
         #[serde(default)]
         pool: Option<PoolConfig>,
+        /// Optional payload compression for stored JSON columns.
+        #[serde(default)]
+        compression: Option<StoreCompressionConfig>,
     }
 
     /// Retirement hook that closes a SQLite pool.
@@ -110,12 +119,13 @@ mod sqlite {
             let cfg = Self::parse(config)?;
             // The pool + url + table names identify one SQLite store instance.
             let key = format!(
-                "sqlite\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "sqlite\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 cfg.database_url.expose_secret(),
                 cfg.responses_table,
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
                 super::pool_fingerprint(cfg.pool.as_ref()),
+                super::compression_fingerprint(cfg.compression.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
         }
@@ -130,6 +140,7 @@ mod sqlite {
                 &cfg.conversations_table,
                 cfg.items_table.as_deref(),
                 cfg.pool.as_ref(),
+                cfg.compression.as_ref(),
             )
             .await
             .map_err(|e| permanent(url, &e.to_string()))?;
@@ -157,7 +168,7 @@ mod postgres {
     use serde_json::Value;
 
     use super::{BackendError, transient};
-    use crate::store::{PgTlsConfig, PoolConfig, PostgresResponseStore, SslMode, postgres_url};
+    use crate::store::{PgTlsConfig, PoolConfig, PostgresResponseStore, SslMode, StoreCompressionConfig, postgres_url};
 
     /// Backend id the Postgres factory answers to.
     pub(crate) const BACKEND_ID: &str = "postgres";
@@ -196,6 +207,9 @@ mod postgres {
         /// Permit a private/loopback database host (opt-in).
         #[serde(default)]
         allow_private_database_url: bool,
+        /// Optional payload compression for stored JSON columns.
+        #[serde(default)]
+        compression: Option<StoreCompressionConfig>,
     }
 
     /// Retirement hook that closes a Postgres pool.
@@ -264,6 +278,7 @@ mod postgres {
                 cfg.items_table.as_deref(),
                 &tls,
                 cfg.pool.as_ref(),
+                cfg.compression.as_ref(),
             ))
             .await
             .map_err(|e| transient(url, &e.to_string()))
@@ -281,7 +296,7 @@ mod postgres {
             // Key on the cert-path values, not mere presence: distinct trust
             // anchors or client identities at different paths are distinct pools.
             let key = format!(
-                "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "postgres\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 cfg.database_url.expose_secret(),
                 cfg.responses_table,
                 cfg.conversations_table,
@@ -292,6 +307,7 @@ mod postgres {
                 cfg.ssl_client_key.as_ref().map_or("", |s| s.expose_secret()),
                 cfg.require_certificate_authentication,
                 super::pool_fingerprint(cfg.pool.as_ref()),
+                super::compression_fingerprint(cfg.compression.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
         }
