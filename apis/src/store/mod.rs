@@ -75,13 +75,15 @@ pub(crate) use schemas::validate_postgres_table_identifiers;
 #[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
 pub(crate) use schemas::validate_postgres_table_set_identifiers;
 
+pub use self::compression::{CompressionAlgorithm, StoreCompressionConfig};
 #[cfg(feature = "store-postgres")]
 pub use self::postgres::PostgresResponseStore;
+#[cfg(feature = "store-postgres")]
+pub use self::postgres::to_pg_ssl_mode;
 #[cfg(feature = "store-postgres")]
 pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
-pub use self::compression::{CompressionAlgorithm, StoreCompressionConfig};
 use crate::StateOwner;
 
 // -----------------------------------------------------------------------------

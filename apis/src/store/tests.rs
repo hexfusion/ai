@@ -5209,6 +5209,7 @@ async fn sqlite_backend_satisfies_the_store_contract() {
         "contract_conversations",
         Some("contract_items"),
         None,
+        None,
     )
     .await
     .expect("store creation should succeed");
