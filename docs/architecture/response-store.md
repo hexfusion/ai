@@ -29,7 +29,11 @@ the selected backend, and provisions pools on the serving runtime before the
 store readiness gate admits traffic. Request-path filters resolve an
 owner-scoped handle from their listener registry and never construct SQL pools.
 Responses and Conversations can share one pool when their effective backend
-configuration matches.
+configuration matches. The provisioner promotes the two filter-shaped configs
+to one combined table set: Responses supplies the responses table,
+Conversations supplies the items table, and both must select the same
+conversations table. Both registry names then resolve the same backend lease and
+SQL pool.
 
 ## Backend Features
 

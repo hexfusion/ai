@@ -136,6 +136,33 @@ pub struct Provisioned {
 }
 
 impl BackendCache {
+    /// Return whether the exact effective backend for `store_ref` is currently
+    /// held by an active or prepared generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvisionError::UnknownBackend`] when no injected factory owns
+    /// the reference, or [`ProvisionError::Backend`] when its config is invalid.
+    pub fn contains(&self, store_ref: &StoreRef) -> Result<bool, ProvisionError> {
+        let factory = self
+            .factories
+            .get(&store_ref.backend_id)
+            .ok_or_else(|| ProvisionError::UnknownBackend {
+                name: Arc::clone(&store_ref.name),
+                backend_id: Arc::clone(&store_ref.backend_id),
+            })?;
+        let config = factory
+            .effective_key(&store_ref.config)
+            .map_err(|source| ProvisionError::Backend {
+                name: Arc::clone(&store_ref.name),
+                source,
+            })?;
+        Ok(self.entries.contains_key(&CacheKey {
+            backend_id: Arc::clone(&store_ref.backend_id),
+            config,
+        }))
+    }
+
     /// Build a cache from injected factories, keyed by backend id.
     #[must_use]
     pub fn new(factories: Vec<Arc<dyn StoreBackendFactory>>) -> Self {
