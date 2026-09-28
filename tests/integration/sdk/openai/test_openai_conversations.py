@@ -26,6 +26,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -510,6 +511,68 @@ def tenant_clients(tenant_praxis_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    DATABASE_URL.startswith("postgres"),
+    reason="cold-start lock regression uses SQLite file locking",
+)
+def test_cold_start_returns_503_until_store_is_ready():
+    """The listener binds promptly but gates requests while SQLite is locked."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "cold-start.db")
+        lock = sqlite3.connect(db_path)
+        lock.execute("CREATE TABLE lock_holder (id INTEGER)")
+        lock.commit()
+        lock.execute("BEGIN EXCLUSIVE")
+        lock_released = False
+        config_path = _write_config(port, db_path)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            default_headers={OWNER_HEADER: _owner_assertion("cold-start")},
+            max_retries=0,
+            timeout=2.0,
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            with pytest.raises(InternalServerError) as pending:
+                client.conversations.retrieve("not-created")
+            assert pending.value.status_code == 503
+
+            lock.commit()
+            lock.close()
+            lock_released = True
+            deadline = time.monotonic() + PROXY_STARTUP_TIMEOUT
+            while True:
+                try:
+                    client.conversations.retrieve("not-created")
+                except NotFoundError:
+                    break
+                except InternalServerError as error:
+                    assert error.status_code == 503
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("store did not become ready after releasing SQLite lock")
+                    time.sleep(0.1)
+        finally:
+            if not lock_released:
+                if lock.in_transaction:
+                    lock.rollback()
+                lock.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 def _message_items(prefix: str, count: int) -> list[dict]:

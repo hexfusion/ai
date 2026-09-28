@@ -4332,7 +4332,7 @@ async fn generated_responses_table_gates_conversations_on_schema_version() {
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
-    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 3")))
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 4")))
         .execute(&pool)
         .await
         .expect("version bump should succeed");

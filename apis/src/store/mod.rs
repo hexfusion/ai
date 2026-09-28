@@ -104,6 +104,17 @@ impl ResponseStoreRegistry {
         self.inner.contains(name)
     }
 
+    /// Mark every store required by this listener ready for request traffic.
+    pub fn mark_ready(&self) {
+        self.inner.mark_ready();
+    }
+
+    /// Return whether every configured store for this listener is registered.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
     /// Return whether two registry handles share the same backing storage.
     #[must_use]
     pub fn shares_storage_with(&self, other: &Self) -> bool {

@@ -3,6 +3,8 @@
 
 //! Hot config reload: validate, build, and atomically swap filter pipelines.
 
+#[cfg(feature = "store")]
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "store")]
@@ -18,6 +20,8 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "store")]
 use crate::pipelines::resolve_pipelines_with_stores;
+#[cfg(feature = "store")]
+use crate::store_config::find_listener_store_configs;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -196,16 +200,31 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_subrequest_connector_changes(old, new);
 }
 
-/// Collect the response-store and conversations-store filter configs across all
-/// chains, for comparison.
+/// Collect the effective store configs bound to each listener.
+///
+/// This follows every inline and named branch chain just like startup
+/// provisioning. Listener names are the keys because each listener owns a
+/// distinct registry even when two listeners share one config.
 #[cfg(feature = "store")]
-fn store_filter_configs(config: &Config) -> Vec<&serde_yaml::Value> {
-    config
+fn store_filter_configs(config: &Config) -> BTreeMap<String, (Vec<serde_yaml::Value>, Vec<serde_yaml::Value>)> {
+    let chains: std::collections::HashMap<&str, &[praxis_core::config::FilterEntry]> = config
         .filter_chains
         .iter()
-        .flat_map(|c| c.filters.iter())
-        .filter(|e| e.filter_type == RESPONSE_STORE_FILTER_NAME || e.filter_type == CONVERSATIONS_STORE_FILTER_NAME)
-        .map(|e| &e.config)
+        .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
+        .collect();
+
+    config
+        .listeners
+        .iter()
+        .filter_map(|listener| {
+            let responses = find_listener_store_configs(listener, &chains, RESPONSE_STORE_FILTER_NAME);
+            let conversations = find_listener_store_configs(listener, &chains, CONVERSATIONS_STORE_FILTER_NAME);
+            if responses.is_empty() && conversations.is_empty() {
+                None
+            } else {
+                Some((listener.name.clone(), (responses, conversations)))
+            }
+        })
         .collect()
 }
 
@@ -420,6 +439,32 @@ mod tests {
 
     use super::*;
     use crate::pipelines::resolve_pipelines;
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn store_reload_comparison_follows_inline_branch_chains() {
+        let old = Config::from_yaml(&inline_branch_store_config("sqlite:///old.db")).unwrap();
+        let new = Config::from_yaml(&inline_branch_store_config("sqlite:///new.db")).unwrap();
+
+        assert_ne!(
+            store_filter_configs(&old),
+            store_filter_configs(&new),
+            "an inline-branch store change must require backend reprovisioning"
+        );
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn store_reload_comparison_tracks_listener_chain_binding() {
+        let old = Config::from_yaml(&listener_store_binding_config("store-a")).unwrap();
+        let new = Config::from_yaml(&listener_store_binding_config("store-b")).unwrap();
+
+        assert_ne!(
+            store_filter_configs(&old),
+            store_filter_configs(&new),
+            "switching a listener between existing stores must require reprovisioning"
+        );
+    }
 
     #[test]
     fn valid_reload_swaps_pipeline() {
@@ -804,6 +849,59 @@ filter_chains:
 "#,
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "store")]
+    fn inline_branch_store_config(database_url: &str) -> String {
+        format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        branch_chains:
+          - name: persisted
+            chains:
+              - name: inline-store
+                filters:
+                  - filter: openai_response_store
+                    backend: sqlite
+                    database_url: "{database_url}"
+                    responses_table: responses
+                    conversations_table: conversations
+"#
+        )
+    }
+
+    #[cfg(feature = "store")]
+    fn listener_store_binding_config(selected_chain: &str) -> String {
+        format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [{selected_chain}]
+filter_chains:
+  - name: store-a
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite:///a.db"
+        responses_table: responses
+        conversations_table: conversations
+  - name: store-b
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite:///b.db"
+        responses_table: responses
+        conversations_table: conversations
+"#
+        )
     }
 
     /// Set up live pipelines, registry, and shutdown token for reload tests.

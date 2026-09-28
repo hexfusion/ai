@@ -73,6 +73,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 notify = { workspace = true }
 pingora-core = { workspace = true }
@@ -107,5 +108,6 @@ praxis-ai-build-support = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 pingora-core = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

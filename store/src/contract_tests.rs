@@ -55,8 +55,47 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     approvals_consume_all_or_nothing(backend).await;
     persist_pairs_response_and_approvals(backend).await;
     conversation_messages_cas(backend).await;
+    conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
+    item_ids_are_owner_scoped(backend).await;
     item_writes_enforce_parent_scope(backend).await;
+}
+
+/// A conversation id is globally unique in the SQL schema: another owner may
+/// not overwrite the existing row.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn conversation_id_is_globally_unique(backend: &dyn PersistedStateBackend) {
+    let (a, b) = (owner("conversation-id-a"), owner("conversation-id-b"));
+    let base = ConversationRecord {
+        conversation_id: "conv_global_id".to_owned(),
+        owner: a.clone(),
+        created_at: 1,
+        metadata: serde_json::json!({}),
+        messages: serde_json::json!([]),
+    };
+    backend.upsert_conversation(&base).await.expect("first owner upsert");
+    let collision = ConversationRecord {
+        owner: b.clone(),
+        ..base
+    };
+    assert!(
+        backend.upsert_conversation(&collision).await.is_err(),
+        "cross-owner conversation id collision accepted"
+    );
+    assert!(
+        ConversationItemStore::get_conversation(backend, &a, "conv_global_id")
+            .await
+            .expect("get original owner")
+            .is_some(),
+        "original conversation lost after rejected collision"
+    );
+    assert!(
+        ConversationItemStore::get_conversation(backend, &b, "conv_global_id")
+            .await
+            .expect("get second owner")
+            .is_none(),
+        "conversation leaked to colliding owner"
+    );
 }
 
 /// A response is visible only to its owner, and delete is scoped.
@@ -328,6 +367,46 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         remaining.messages.as_array().map(Vec::len),
         Some(1),
         "message cache rebuilt after delete"
+    );
+}
+
+/// Provider-generated item ids may collide across owners without either row
+/// shadowing the other.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn item_ids_are_owner_scoped(backend: &dyn PersistedStateBackend) {
+    let (a, b) = (owner("item-owner-a"), owner("item-owner-b"));
+    for (owner, conversation_id) in [(&a, "conv_owner_a"), (&b, "conv_owner_b")] {
+        backend
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: conversation_id.to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .expect("upsert owner-scoped conversation");
+        backend
+            .create_conversation_items(&[item(owner, conversation_id, "shared_item_id")])
+            .await
+            .expect("same item id must be accepted for a different owner");
+    }
+
+    assert!(
+        backend
+            .get_conversation_item(&a, "conv_owner_a", "shared_item_id")
+            .await
+            .expect("get owner a item")
+            .is_some(),
+        "owner a item missing"
+    );
+    assert!(
+        backend
+            .get_conversation_item(&b, "conv_owner_b", "shared_item_id")
+            .await
+            .expect("get owner b item")
+            .is_some(),
+        "owner b item missing"
     );
 }
 

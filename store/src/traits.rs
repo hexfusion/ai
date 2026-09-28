@@ -325,8 +325,9 @@ pub trait ConversationItemStore: Send + Sync {
 
     /// Insert one or more conversation items.
     ///
-    /// Items are inserted individually. A duplicate globally unique `item_id`
-    /// fails and cannot transfer the original item's owner.
+    /// Items are inserted individually. An `item_id` is unique within one exact
+    /// owner, so a duplicate for that owner fails while another owner may use
+    /// the same provider-generated id.
     ///
     /// # Errors
     ///

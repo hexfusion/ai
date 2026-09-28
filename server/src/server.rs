@@ -125,12 +125,13 @@ fn boot_server(
                 "store-provision",
                 service,
             ));
-        register_store_readiness_endpoint(
-            &mut server,
-            state.store_readiness.clone(),
-            Arc::clone(&state.health_slot),
-        );
     }
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    register_store_readiness_endpoint(
+        &mut server,
+        state.store_readiness.clone(),
+        Arc::clone(&state.health_slot),
+    );
 
     let _watcher = spawn_watcher(config_path, config, registry, state);
 

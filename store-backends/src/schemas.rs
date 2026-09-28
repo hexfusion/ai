@@ -32,12 +32,14 @@ pub(crate) struct TableNames {
 
 /// Current schema version. Bump this when the DDL changes.
 ///
-/// Version 3 stores the responses table's JSON payload columns
+/// Version 4 scopes conversation-item uniqueness to the complete owner so two
+/// tenants can use the same item and conversation identifiers safely. Version
+/// 3 stores the responses table's JSON payload columns
 /// (`response_object`, `input`, `messages`) as native binary (`BLOB`
 /// on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so the
 /// response store can persist compressed payloads. Version 2 databases
 /// must be migrated before use.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 /// Suffix appended to the responses table name to derive the schema
 /// version table name.
@@ -279,7 +281,7 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
             item_data         TEXT NOT NULL,
             created_at        BIGINT NOT NULL,
             position          BIGINT NOT NULL,
-            PRIMARY KEY (item_id)
+            PRIMARY KEY (tenant_id, owner_issuer, owner_subject, item_id)
         )"
     ));
     stmts.push(format!(
@@ -288,7 +290,7 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
     ));
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
-         ON {i}(conversation_id, position)"
+         ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
     ));
 }
 
@@ -486,14 +488,21 @@ const RESPONSES_PRIMARY_KEY: &[&str] = &["id"];
 const CONVERSATIONS_PRIMARY_KEY: &[&str] = &["conversation_id"];
 
 /// Expected ordered primary key columns for the items table.
-const ITEMS_PRIMARY_KEY: &[&str] = &["item_id"];
+const ITEMS_PRIMARY_KEY: &[&str] = &["tenant_id", "owner_issuer", "owner_subject", "item_id"];
 
 /// Columns of the one unique index the items table generates beyond its primary
 /// key (`idx_<items>_position`).
 ///
-/// Conversation IDs are globally owner-immutable, so they safely scope item
-/// positions without repeating identity columns in the index.
-const ITEMS_POSITION_UNIQUE: &[&str] = &["conversation_id", "position"];
+/// Item positions are unique within one owner's conversation. Owner columns
+/// are part of the index because conversation identifiers can be reused by a
+/// different tenant without changing that tenant's item ordering semantics.
+const ITEMS_POSITION_UNIQUE: &[&str] = &[
+    "tenant_id",
+    "owner_issuer",
+    "owner_subject",
+    "conversation_id",
+    "position",
+];
 
 /// Expected ordered primary key columns for the server-owned pending-approvals
 /// table.
@@ -1323,9 +1332,23 @@ mod tests {
         // matter.
         let items = actual_table(
             ITEMS_COLUMNS,
-            &[("item_id", None)],
+            &[
+                ("tenant_id", None),
+                ("owner_issuer", None),
+                ("owner_subject", None),
+                ("item_id", None),
+            ],
             true,
-            &[("idx_i_position", &["position", "conversation_id"])],
+            &[(
+                "idx_i_position",
+                &[
+                    "position",
+                    "conversation_id",
+                    "owner_subject",
+                    "owner_issuer",
+                    "tenant_id",
+                ],
+            )],
         );
         let input = [("i", ITEMS_TABLE, &items)];
         check_schema(&input).expect("the store's own items unique index must be accepted");
@@ -1335,7 +1358,12 @@ mod tests {
     fn check_schema_rejects_an_unexpected_items_unique_index() {
         let items = actual_table(
             ITEMS_COLUMNS,
-            &[("item_id", None)],
+            &[
+                ("tenant_id", None),
+                ("owner_issuer", None),
+                ("owner_subject", None),
+                ("item_id", None),
+            ],
             true,
             &[("uq_bad", &["tenant_id", "conversation_id", "position"])],
         );
@@ -1638,6 +1666,16 @@ mod tests {
             ddl[4].contains("idx_test_items_conversation"),
             "fifth statement should create items index: {}",
             ddl[4]
+        );
+        assert!(
+            ddl[3].contains("PRIMARY KEY (tenant_id, owner_issuer, owner_subject, item_id)"),
+            "item identity must be owner-scoped: {}",
+            ddl[3]
+        );
+        assert!(
+            ddl[5].contains("(tenant_id, owner_issuer, owner_subject, conversation_id, position)"),
+            "item positions must be unique only within an owner's conversation: {}",
+            ddl[5]
         );
     }
 

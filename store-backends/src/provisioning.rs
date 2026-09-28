@@ -31,21 +31,38 @@ fn transient(url: &str, message: &str) -> BackendError {
 /// A stable fingerprint of the pool overrides for the dedup key.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn pool_fingerprint(pool: Option<&crate::PoolConfig>) -> String {
-    pool.map_or_else(
-        || "default".to_owned(),
-        |p| {
-            format!(
-                "{:?}/{:?}/{:?}/{:?}",
-                p.max_connections, p.min_connections, p.idle_timeout_secs, p.acquire_timeout_secs
-            )
-        },
+    let pool = pool.cloned().unwrap_or_default();
+    format!(
+        "{}/{}/{}/{}",
+        pool.max_connections.unwrap_or(praxis_ai_store::DEFAULT_MAX_CONNECTIONS),
+        pool.min_connections.unwrap_or(praxis_ai_store::DEFAULT_MIN_CONNECTIONS),
+        pool.idle_timeout_secs
+            .unwrap_or(praxis_ai_store::DEFAULT_IDLE_TIMEOUT_SECS),
+        pool.acquire_timeout_secs
+            .unwrap_or(praxis_ai_store::DEFAULT_ACQUIRE_TIMEOUT_SECS),
     )
 }
 
 /// A stable fingerprint of the compression override for the dedup key.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn compression_fingerprint(compression: Option<&praxis_ai_store::StoreCompressionConfig>) -> String {
-    compression.map_or_else(|| "none".to_owned(), |c| format!("{:?}/{:?}", c.algorithm, c.level))
+    use praxis_ai_store::CompressionAlgorithm;
+
+    match compression {
+        None
+        | Some(praxis_ai_store::StoreCompressionConfig {
+            algorithm: CompressionAlgorithm::None,
+            level: None,
+        }) => "none".to_owned(),
+        Some(praxis_ai_store::StoreCompressionConfig {
+            algorithm: CompressionAlgorithm::None,
+            level: Some(level),
+        }) => format!("invalid-none/{level}"),
+        Some(praxis_ai_store::StoreCompressionConfig {
+            algorithm: CompressionAlgorithm::Zstd,
+            level,
+        }) => format!("zstd/{}", level.unwrap_or(3)),
+    }
 }
 
 /// SQLite-backed store-backend factory.
@@ -306,7 +323,7 @@ mod postgres {
                 cfg.responses_table,
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
-                cfg.ssl_mode,
+                cfg.ssl_mode.unwrap_or_default(),
                 cfg.ssl_root_cert.as_ref().map_or("", |s| s.expose_secret()),
                 cfg.ssl_client_cert.as_ref().map_or("", |s| s.expose_secret()),
                 cfg.ssl_client_key.as_ref().map_or("", |s| s.expose_secret()),
@@ -372,7 +389,17 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    #[cfg(feature = "postgres")]
+    use super::postgres::PostgresBackendFactory;
     use super::sqlite::SqliteBackendFactory;
+
+    fn with_field(mut config: serde_json::Value, name: &str, value: serde_json::Value) -> serde_json::Value {
+        config
+            .as_object_mut()
+            .expect("test store config must be an object")
+            .insert(name.to_owned(), value);
+        config
+    }
 
     /// Build a cache holding only the real SQLite factory.
     fn sqlite_cache() -> BackendCache {
@@ -393,6 +420,72 @@ mod tests {
                 "items_table": "conversation_items",
             }),
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compares every semantically equivalent default form"
+    )]
+    fn sqlite_effective_key_canonicalizes_pool_and_compression_defaults() {
+        let base = json!({
+            "database_url": "sqlite::memory:",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let factory = SqliteBackendFactory;
+        let expected = factory.effective_key(&base).expect("base key");
+
+        let empty_pool = factory
+            .effective_key(&with_field(base.clone(), "pool", json!({})))
+            .expect("empty pool key");
+        let explicit_pool = factory
+            .effective_key(&with_field(
+                base.clone(),
+                "pool",
+                json!({
+                    "max_connections": 10,
+                    "min_connections": 0,
+                    "idle_timeout_secs": 600,
+                    "acquire_timeout_secs": 30,
+                }),
+            ))
+            .expect("explicit pool defaults key");
+        let compression_none = factory
+            .effective_key(&with_field(base.clone(), "compression", json!({"algorithm": "none"})))
+            .expect("explicit no-compression key");
+        assert_eq!(empty_pool, expected);
+        assert_eq!(explicit_pool, expected);
+        assert_eq!(compression_none, expected);
+
+        let implicit_zstd = factory
+            .effective_key(&with_field(base.clone(), "compression", json!({"algorithm": "zstd"})))
+            .expect("implicit zstd level key");
+        let explicit_zstd = factory
+            .effective_key(&with_field(
+                base,
+                "compression",
+                json!({"algorithm": "zstd", "level": 3}),
+            ))
+            .expect("explicit zstd level key");
+        assert_eq!(implicit_zstd, explicit_zstd);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_effective_key_canonicalizes_default_ssl_mode() {
+        let base = json!({
+            "database_url": "postgresql://user@8.8.8.8/store",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let factory = PostgresBackendFactory;
+        let implicit = factory.effective_key(&base).expect("implicit TLS key");
+        let explicit = factory
+            .effective_key(&with_field(base, "ssl_mode", json!("verify-full")))
+            .expect("explicit TLS key");
+
+        assert_eq!(implicit, explicit);
     }
 
     #[tokio::test]

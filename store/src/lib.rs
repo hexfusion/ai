@@ -24,7 +24,10 @@ pub mod memory;
 #[cfg(feature = "test-support")]
 pub mod contract_tests;
 
-pub use backend_config::{DEFAULT_MAX_CONNECTIONS, MAX_IDENTIFIER_LEN, PoolConfig, SslMode, validate_table_identifier};
+pub use backend_config::{
+    DEFAULT_ACQUIRE_TIMEOUT_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MIN_CONNECTIONS,
+    MAX_IDENTIFIER_LEN, PoolConfig, SslMode, validate_table_identifier,
+};
 #[cfg(feature = "compression")]
 pub use compression::{CompressionAlgorithm, StoreCompressionConfig};
 pub use factory::{BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};

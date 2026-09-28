@@ -11,6 +11,7 @@
 //! [`ResponseStore`]: praxis_ai_store::ResponseStore
 //! [`StoreBackendFactory`]: praxis_ai_store::StoreBackendFactory
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod pool;
 #[cfg(feature = "postgres")]
 mod postgres;
@@ -18,7 +19,9 @@ mod postgres;
 mod postgres_tls;
 #[cfg(feature = "postgres")]
 pub mod postgres_url;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod provisioning;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod schemas;
 #[cfg(feature = "sqlite")]
 mod sqlite;
@@ -37,6 +40,7 @@ pub(crate) use praxis_ai_store::PoolConfig;
 pub(crate) use praxis_ai_store::SslMode;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) use praxis_ai_store::compression;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
     ResponseStore, StoreError,

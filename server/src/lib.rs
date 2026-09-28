@@ -8,11 +8,15 @@ pub(crate) mod pipelines;
 pub mod readiness;
 pub(crate) mod reload;
 mod server;
+#[cfg(feature = "store")]
+mod store_config;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub use pipelines::validate_pipelines_with_store_wiring;
 pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{

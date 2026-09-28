@@ -2854,7 +2854,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 3, "fresh store should stamp version 3");
+    assert_eq!(version, 4, "fresh store should stamp version 4");
 }
 
 #[tokio::test]
@@ -2956,15 +2956,16 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
         "store must refuse a version-2 database"
     );
 
-    // Apply the documented operator migration: CAST the responses payload
-    // columns to BLOB storage class and bump the schema version.
+    // Apply the documented operator migrations: CAST the responses payload
+    // columns to BLOB storage class and stamp the current schema version. This
+    // fixture has no items table, so v3 -> v4 requires only the version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 3",
+        "UPDATE mr_schema_version SET version = 4",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2976,7 +2977,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-3 database");
+        .expect("store should start on a migrated version-4 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3677,7 +3678,7 @@ async fn pg_rejects_schema_version_mismatch() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
+async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
     let fx = PgSchemaFixture::new("mig");
 
     let legacy_v2 = [
@@ -3720,14 +3721,14 @@ async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 3", fx.version),
+        format!("UPDATE {} SET version = 4", fx.version),
     ];
-    let migrated_v3: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v3, &[]).await;
+    let result = fx.init(&migrated_v4, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-3 database: {:?}",
+        "store should start on a migrated version-4 database: {:?}",
         result.err()
     );
 }
@@ -4559,6 +4560,20 @@ async fn pg_conversation_item_tenant_isolation() {
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
+
+    let same_id_for_tenant_b = make_conversation_item("item_1", "tenant_b", "conv_2", 1);
+    store
+        .create_test_items(&[same_id_for_tenant_b])
+        .await
+        .expect("the same item ID should be accepted for another tenant");
+
+    for (tenant_id, conversation_id) in [("tenant_a", "conv_1"), ("tenant_b", "conv_2")] {
+        let fetched = store
+            .get_conversation_item(&crate::test_utils::test_owner(tenant_id), conversation_id, "item_1")
+            .await
+            .expect("tenant-scoped get should succeed");
+        assert!(fetched.is_some(), "{tenant_id} should see its own item");
+    }
 }
 
 #[tokio::test]

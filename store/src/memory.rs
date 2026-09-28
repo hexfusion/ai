@@ -47,10 +47,12 @@ struct Inner {
     responses: HashMap<String, ResponseRecord>,
     /// `(owner, conversation_id)` -> conversation record.
     conversations: HashMap<OwnerKey, ConversationRecord>,
+    /// Globally unique conversation IDs and the owner currently holding each.
+    conversation_ids: HashMap<String, StateOwner>,
     /// `(owner, conversation_id)` -> its items (unordered; sorted on read).
     items: HashMap<OwnerKey, Vec<ConversationItemRecord>>,
-    /// Globally unique item ids, enforcing cross-owner item-id uniqueness.
-    item_ids: HashSet<String>,
+    /// `(owner, item_id)` keys, matching the owner-qualified SQL primary key.
+    item_ids: HashSet<OwnerKey>,
     /// `(owner, response_id, approval_id)` -> approval + consumption stamp.
     approvals: HashMap<(StateOwner, String, String), StoredApproval>,
 }
@@ -98,13 +100,16 @@ fn upsert_response_into(inner: &mut Inner, record: &ResponseRecord) -> Result<()
     Ok(())
 }
 
-/// Reject a batch that reuses an item id, within itself or against stored rows.
+/// Reject a batch that reuses an item id for the same owner, within itself or
+/// against stored rows.
 ///
-/// Mirrors the SQL item `PRIMARY KEY (item_id)`, which is globally unique.
+/// The owned key copies are required because the set outlives this call and
+/// mirrors the SQL `(owner, item_id)` primary key.
 fn reject_duplicate_item_ids(inner: &Inner, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
-    let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+    let mut seen: HashSet<OwnerKey> = HashSet::with_capacity(items.len());
     for item in items {
-        if !seen.insert(item.item_id.as_str()) || inner.item_ids.contains(&item.item_id) {
+        let key = (item.owner.clone(), item.item_id.clone());
+        if !seen.insert(key.clone()) || inner.item_ids.contains(&key) {
             return Err(StoreError::InvalidInput(format!(
                 "conversation item '{}' already exists",
                 item.item_id
@@ -273,6 +278,11 @@ impl ResponseStore for InMemoryStore {
 impl ConversationItemStore for InMemoryStore {
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         let mut inner = self.lock()?;
+        if let Some(existing_owner) = inner.conversation_ids.get(&record.conversation_id)
+            && existing_owner != &record.owner
+        {
+            return Err(StoreError::Database("conversation id collision".to_owned()));
+        }
         let key = (record.owner.clone(), record.conversation_id.clone());
         // Preserve the original creation time on update; refreshes of metadata
         // or messages must not rewrite created_at.
@@ -282,6 +292,9 @@ impl ConversationItemStore for InMemoryStore {
             .map_or(record.created_at, |existing| existing.created_at);
         let mut stored = record.clone();
         stored.created_at = created_at;
+        inner
+            .conversation_ids
+            .insert(record.conversation_id.clone(), record.owner.clone());
         inner.conversations.insert(key, stored);
         Ok(())
     }
@@ -359,10 +372,14 @@ impl ConversationItemStore for InMemoryStore {
     async fn delete_conversation(&self, owner: &StateOwner, conversation_id: &str) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
         // Matches the OpenAI API: deleting a conversation leaves item rows.
-        Ok(inner
+        let removed = inner
             .conversations
             .remove(&(owner.clone(), conversation_id.to_owned()))
-            .is_some())
+            .is_some();
+        if removed {
+            inner.conversation_ids.remove(conversation_id);
+        }
+        Ok(removed)
     }
 
     async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
@@ -382,7 +399,7 @@ impl ConversationItemStore for InMemoryStore {
         }
         reject_duplicate_item_ids(&inner, items)?;
         for item in items {
-            inner.item_ids.insert(item.item_id.clone());
+            inner.item_ids.insert((item.owner.clone(), item.item_id.clone()));
             inner
                 .items
                 .entry((item.owner.clone(), item.conversation_id.clone()))
@@ -465,7 +482,7 @@ impl ConversationItemStore for InMemoryStore {
             return Ok(false);
         };
         items.remove(index);
-        inner.item_ids.remove(item_id);
+        inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
         Ok(true)
     }
 
@@ -517,7 +534,7 @@ impl ConversationItemStore for InMemoryStore {
             // position field is ignored.
             let mut stored = item.clone();
             stored.position = next;
-            inner.item_ids.insert(stored.item_id.clone());
+            inner.item_ids.insert((stored.owner.clone(), stored.item_id.clone()));
             inner.items.entry(key.clone()).or_default().push(stored);
         }
         let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
@@ -542,7 +559,7 @@ impl ConversationItemStore for InMemoryStore {
             return Ok(false);
         };
         items.remove(index);
-        inner.item_ids.remove(item_id);
+        inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
         let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));
         if let Some(conversation) = inner.conversations.get_mut(&key) {
             conversation.messages = rebuilt;
@@ -692,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_item_id_is_rejected_across_owners() {
+    async fn duplicate_item_id_is_allowed_across_owners() {
         let store = InMemoryStore::new();
         let a = owner("a");
         let b = owner("b");
@@ -712,7 +729,11 @@ mod tests {
             .create_conversation_items(&[item(&a, "c1", "shared", 1)])
             .await
             .unwrap();
-        let err = store.create_conversation_items(&[item(&b, "c2", "shared", 1)]).await;
-        assert!(matches!(err, Err(StoreError::InvalidInput(_))));
+        store
+            .create_conversation_items(&[item(&b, "c2", "shared", 1)])
+            .await
+            .unwrap();
+        assert!(store.get_conversation_item(&a, "c1", "shared").await.unwrap().is_some());
+        assert!(store.get_conversation_item(&b, "c2", "shared").await.unwrap().is_some());
     }
 }

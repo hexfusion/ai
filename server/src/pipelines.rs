@@ -52,9 +52,40 @@ pub fn resolve_pipelines(
             health_registry,
             kv_stores,
             subrequest_client,
+            |_| false,
             |_, _| {},
         )
     }
+}
+
+/// Validate pipelines with the same listener store registries and readiness
+/// gates that server startup constructs.
+///
+/// This is the CLI validation path for builds with a concrete store backend.
+/// It validates store references without opening pools, then builds the exact
+/// effective filter ordering used while serving.
+///
+/// # Errors
+///
+/// Returns an error from store wiring validation or pipeline construction.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub fn validate_pipelines_with_store_wiring(
+    config: &Config,
+    registry: &FilterRegistry,
+    health_registry: &praxis_core::health::HealthRegistry,
+    kv_stores: &praxis_core::kv::KvStoreRegistry,
+    subrequest_client: &praxis_core::subrequest::SubRequestClient,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (store_registries, _service, _readiness) = crate::store_provision::build_store_wiring(config)?;
+    resolve_pipelines_with_stores(
+        config,
+        registry,
+        health_registry,
+        kv_stores,
+        subrequest_client,
+        &store_registries,
+    )?;
+    Ok(())
 }
 
 /// Like [`resolve_pipelines`], but attaches a caller-provided
@@ -85,6 +116,7 @@ pub(crate) fn resolve_pipelines_with_stores(
         health_registry,
         kv_stores,
         subrequest_client,
+        |listener| store_registries.contains_key(&listener.name),
         |listener, pipeline| {
             pipeline.add_pipeline_extension(Box::new(
                 store_registries.get(&listener.name).cloned().unwrap_or_default(),
@@ -102,6 +134,7 @@ pub(crate) fn resolve_pipelines_with_stores(
 /// Returns an error when pipeline construction fails.
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "threads config, registries, shared services, the policy-connector setup, and a per-listener hook"
 )]
 fn build_listener_pipelines(
@@ -110,6 +143,7 @@ fn build_listener_pipelines(
     health_registry: &praxis_core::health::HealthRegistry,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
@@ -131,6 +165,21 @@ fn build_listener_pipelines(
             entries.extend_from_slice(chain_filters);
         }
 
+        #[cfg(feature = "store")]
+        if gate_store_traffic(listener) {
+            // Provider chains require peer_identity_trust to remain the first
+            // filter. The readiness gate is otherwise the first operator so it
+            // rejects cold-start traffic before any store consumer runs.
+            let gate_index = usize::from(
+                entries
+                    .first()
+                    .is_some_and(|entry| entry.filter_type == "peer_identity_trust"),
+            );
+            entries.insert(gate_index, store_readiness_gate_entry());
+        }
+        #[cfg(not(feature = "store"))]
+        let _ = &gate_store_traffic;
+
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
@@ -143,6 +192,21 @@ fn build_listener_pipelines(
     }
 
     Ok(ListenerPipelines::new(pipelines))
+}
+
+/// Build the server-owned gate placed before store consumers on a listener
+/// whose store registry is provisioned asynchronously.
+#[cfg(feature = "store")]
+fn store_readiness_gate_entry() -> FilterEntry {
+    FilterEntry {
+        filter_type: praxis_ai_filters::STORE_READINESS_GATE_FILTER_NAME.to_owned(),
+        branch_chains: None,
+        conditions: Vec::new(),
+        name: None,
+        response_conditions: Vec::new(),
+        failure_mode: FailureMode::Closed,
+        config: serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+    }
 }
 
 /// Apply body limits, health registry, KV stores, and insecure options to a

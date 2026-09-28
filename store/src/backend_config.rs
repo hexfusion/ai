@@ -24,6 +24,15 @@ use crate::types::StoreError;
 /// prewarmed minimum.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 
+/// sqlx's implicit minimum idle connection count.
+pub const DEFAULT_MIN_CONNECTIONS: u32 = 0;
+
+/// sqlx's implicit idle timeout in seconds.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+
+/// sqlx's implicit connection-acquire timeout in seconds.
+pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+
 /// Maximum length for a table name identifier.
 ///
 /// SQLite has no identifier length limit, but table names are capped to prevent

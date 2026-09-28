@@ -9,7 +9,10 @@
 //! owner rather than the raw backend, so a later operation cannot substitute an
 //! arbitrary tenant or principal.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use dashmap::{DashMap, mapref::entry::Entry};
 
@@ -28,6 +31,8 @@ pub struct StoreRegistry {
     /// Named combined backends.
     #[expect(clippy::type_complexity, reason = "DashMap of trait objects is inherently verbose")]
     stores: Arc<DashMap<Arc<str>, Arc<dyn PersistedStateBackend>>>,
+    /// Set only after every backend required by this listener is registered.
+    ready: Arc<AtomicBool>,
 }
 
 /// Backend handle permanently bound to one validated owner.
@@ -360,6 +365,7 @@ impl StoreRegistry {
     pub fn new() -> Self {
         Self {
             stores: Arc::new(DashMap::new()),
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -402,6 +408,17 @@ impl StoreRegistry {
         self.stores.contains_key(name)
     }
 
+    /// Mark this listener's complete store set ready for request traffic.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    /// Return whether every configured backend for this listener is registered.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
     /// Internal raw lookup used only to construct a constrained facade.
     fn get_backend(&self, name: &str) -> Option<Arc<dyn PersistedStateBackend>> {
         self.stores.get(name).map(|r| Arc::clone(r.value()))
@@ -410,7 +427,7 @@ impl StoreRegistry {
     /// Return whether two registry handles share the same backing storage.
     #[must_use]
     pub fn shares_storage_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.stores, &other.stores)
+        Arc::ptr_eq(&self.stores, &other.stores) && Arc::ptr_eq(&self.ready, &other.ready)
     }
 }
 

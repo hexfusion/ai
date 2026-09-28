@@ -61,7 +61,11 @@ RUN sed -i '/xtask/d; /tests\//d; /benchmarks/d' Cargo.toml
 
 # Create stub source files for the crates whose real source isn't
 # needed until after dependencies are cached.
-RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
+RUN mkdir -p store/src store-lifecycle/src store-backends/src \
+        apis/src filters/src server/src integrations/llmd/ext-proc/src \
+    && echo '//! stub' > store/src/lib.rs \
+    && echo '//! stub' > store-lifecycle/src/lib.rs \
+    && echo '//! stub' > store-backends/src/lib.rs \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
@@ -88,7 +92,8 @@ COPY filters/src ./filters/src
 COPY server/src ./server/src
 COPY integrations/llmd/ext-proc/src ./integrations/llmd/ext-proc/src
 
-RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
+RUN find store/src store-lifecycle/src store-backends/src \
+        apis/src filters/src server/src integrations/llmd/ext-proc/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------
