@@ -232,11 +232,11 @@ impl BackendCache {
     /// touching a runtime, so a malformed or unknown-backend config fails at
     /// pipeline construction rather than at first traffic.
     ///
-    /// Pool creation stays lazy on the serving runtime: sqlx pools bind to the
+    /// Pool creation stays on the serving runtime: sqlx pools bind to the
     /// runtime that opens them, and the server owns that runtime, which is not
-    /// reachable at synchronous pipeline construction. "Eager" is therefore
-    /// eager config validation here; a well-configured but unreachable backend
-    /// surfaces at first touch, not silently per request.
+    /// reachable at synchronous pipeline construction. This method performs
+    /// eager config validation; the server provisioner then opens every pool
+    /// before store readiness admits traffic.
     ///
     /// # Errors
     ///

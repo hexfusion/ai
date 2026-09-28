@@ -76,7 +76,7 @@ pub fn validate_pipelines_with_store_wiring(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (store_registries, _service, _readiness) = crate::store_provision::build_store_wiring(config)?;
+    let (store_registries, _service, _reload, _readiness) = crate::store_provision::build_store_wiring(config)?;
     resolve_pipelines_with_stores(
         config,
         registry,

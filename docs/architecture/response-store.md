@@ -6,51 +6,62 @@ input-item pagination across proxy restarts.
 
 ## Design
 
-The response store is split into two layers:
+Persistence is split into explicit dependency layers:
 
 ```text
-ResponseStoreFilter (filter layer)
+Responses / Conversations filters
   |
-  |-- classifies request (POST/GET/DELETE)
-  |-- gates persistence via metadata
-  |-- persists at end-of-stream via block_in_place
+  +-- owner-scoped service APIs
+  |
+praxis-ai-store
+  |-- SQL-free records, traits, registries, and backend factory contracts
   v
-ResponseStore trait (storage layer)
+praxis-ai-store-lifecycle
+  |-- generation leases, effective-config deduplication, bounded retry
+  v
+praxis-ai-store-backends
   |
-  +-- SqliteResponseStore
-  +-- PostgresResponseStore
+  +-- PostgreSQL and SQLite pools, schemas, and TLS
 ```
 
-The filter layer lives in the OpenAI responses module
-and handles HTTP lifecycle concerns. The storage layer
-is a generic async trait shared across providers.
+The production binary scans every listener's reachable filter chains, validates
+the selected backend, and provisions pools on the serving runtime before the
+store readiness gate admits traffic. Request-path filters resolve an
+owner-scoped handle from their listener registry and never construct SQL pools.
+Responses and Conversations can share one pool when their effective backend
+configuration matches.
 
 ## Backend Features
 
-No store backend is compiled into the default `standard` build. PostgreSQL
-is the production backend and is part of the `full` feature set that the
-release image uses. The same feature selection applies to both the Responses
-store and the Conversations store:
+The default `praxis-ai-proxy` build uses `full`, so PostgreSQL-backed Responses
+and Conversations are available in the production binary while SQLite remains
+opt-in. Explicit `--no-default-features` builds provide the four supported
+persistence profiles:
 
-| Feature | Backends |
-|---------|----------|
-| `store-postgres` | PostgreSQL through SQLx native TLS (part of `full`) |
-| `store-sqlite` | SQLite only |
-| `store-all` | PostgreSQL and SQLite |
+| Profile | Feature selection | SQL backends |
+|---------|-------------------|--------------|
+| Backend-free | `standard,openai-all` | None; contracts, services, and filters only |
+| PostgreSQL-only | `standard,openai-all,store-postgres` | PostgreSQL through SQLx native TLS |
+| SQLite-only | `standard,openai-all,store-sqlite` | SQLite |
+| Combined | `standard,openai-all,store-all` | PostgreSQL and SQLite |
 
-The store features only compile the Responses store filters. The Conversations
-API also needs `openai-conversations` (for example
-`--features openai-conversations,store-sqlite`).
+The backend-free profile is an internal composition and testing lane. A config
+that selects an implementation absent from the binary is rejected during
+pipeline construction with an actionable backend-unavailable diagnostic.
 
 SQLite examples require an explicit build:
 
 ```console
-cargo run -p praxis-ai-proxy --features store-sqlite -- \
+cargo run -p praxis-ai-proxy --no-default-features \
+  --features standard,openai-all,store-sqlite -- \
   -c examples/configs/openai/responses/response-store.yaml
 ```
 
-A configuration that selects a backend absent from the binary is rejected
-while the filter pipeline is constructed, before the proxy serves traffic.
+Store configuration reload is generation-based. The serving runtime provisions
+and validates the replacement generation first, the watcher atomically swaps
+pipelines only after it succeeds, and the old generation retains its leases
+until request-held pipeline references drain. Identical configurations reuse
+the cached pool; changed configurations retire the previous pool after drain.
 
 ## Request Phases
 
@@ -72,12 +83,10 @@ the persistence decision as new information arrives:
   unknown parameters are rejected with a 400
   response.
 - Handles `DELETE /v1/responses/{id}` locally.
-- Lazily initializes the store backend.
-- Rejects with a 500 response on store init failure
-  for any request that requires the store
-  (persistence, rehydration, GET retrieval, or
-  DELETE). Locally owned endpoints never fall through
-  to the upstream when the backend is unavailable.
+- Resolves the owner-scoped store service from the listener registry.
+- Rejects fail-closed if a request requiring persistence reaches an
+  unprovisioned registry. The readiness gate normally prevents that state from
+  receiving traffic.
 
 ### `on_response`
 
@@ -113,17 +122,18 @@ client observes the completed response, preventing
 races where a subsequent `DELETE` arrives before the
 upsert completes.
 
-## Store Initialization
+## Store Provisioning
 
-Store backends are lazily initialized via
-`tokio::sync::OnceCell`:
-
-- **SQLite**: Failed init is cached permanently as
-  `None` and never retried (local file; unlikely to
-  recover without config change).
-- **PostgreSQL**: Uses `get_or_try_init` so transient
-  connection failures are retried on subsequent
-  requests.
+Pools are created eagerly by the server-owned provisioner, never by a request
+filter. Each backend factory validates its typed configuration before pool
+creation. The lifecycle cache retries `BackendError::Transient` within a
+bounded attempt budget; exhaustion becomes terminal `Unavailable`. Invalid
+configuration, unsupported schemas, and other permanent initialization
+failures are terminal immediately and are not retried forever. Aggregate store
+readiness becomes ready only after every configured listener owns a live
+generation lease. Pool opening and schema preparation have a 30-second
+end-to-end deadline so a database lock cannot block reload or shutdown
+indefinitely.
 
 ## Storage Backends
 
@@ -172,20 +182,14 @@ pass-through traffic is not held.
 
 ## Key Files
 
-- `apis/src/openai/responses/store/filter.rs`:
-  filter implementation and lifecycle
-- `apis/src/openai/responses/store/config.rs`:
-  configuration, SSRF validation
-- `apis/src/store/trait_def.rs`:
-  `ResponseStore` trait
-- `apis/src/store/types.rs`:
-  `ResponseRecord`, `StoreError`
-- `apis/src/store/sqlite.rs`:
-  SQLite backend
-- `apis/src/store/postgres.rs`:
-  PostgreSQL backend
-- `apis/src/store/schemas.rs`:
-  DDL generation and identifier validation
+- `apis/src/openai/responses/store/filter.rs`: HTTP filter lifecycle
+- `apis/src/service/responses/`: independently testable Responses service
+- `apis/src/service/conversations/`: independently testable Conversations service
+- `store/`: SQL-free contracts, records, registries, and factory traits
+- `store-lifecycle/`: cache, retry, generation leases, reuse, and retirement
+- `store-backends/`: SQLx implementations, pools, schemas, TLS, and factories
+- `server/src/store_provision.rs`: listener planning, readiness, and serving-runtime provisioning
+- `server/src/reload.rs`: atomic pipeline-generation reload orchestration
 
 ## Related
 

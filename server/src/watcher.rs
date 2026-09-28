@@ -65,9 +65,9 @@ pub(crate) struct WatcherParams {
     /// Shared sub-request client, preserved across reloads.
     pub(crate) subrequest_client: praxis_core::subrequest::SubRequestClient,
 
-    /// Per-listener response-store registries, reused so a reloaded pipeline
-    /// keeps the serving-runtime-provisioned backends.
-    pub(crate) store_registries: crate::StoreRegistries,
+    /// Handle that provisions replacement store generations on the serving
+    /// runtime before a reload swaps pipelines.
+    pub(crate) store_reload: crate::StoreReloadHandle,
 
     /// Shared cluster-health registry, updated on reload so the readiness
     /// endpoint reads current health rather than the startup snapshot.
@@ -133,7 +133,7 @@ async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
                     &params.health_shutdown,
                     &params.kv_stores,
                     &params.subrequest_client,
-                    &params.store_registries,
+                    &params.store_reload,
                     &params.health_slot,
                 );
             }
@@ -159,7 +159,7 @@ fn handle_reload(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
-    store_registries: &crate::StoreRegistries,
+    store_reload: &crate::StoreReloadHandle,
     health_slot: &crate::SharedHealthRegistry,
 ) {
     let content = match std::fs::read_to_string(config_path) {
@@ -194,7 +194,7 @@ fn handle_reload(
         health_shutdown,
         kv_stores,
         subrequest_client,
-        store_registries,
+        store_reload,
         health_slot,
     ) {
         Ok(()) => {
@@ -325,7 +325,7 @@ mod tests {
             registry,
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: crate::StoreRegistries::default(),
+            store_reload: crate::StoreReloadHandle::default(),
             health_slot: crate::SharedHealthRegistry::default(),
         });
 
@@ -362,7 +362,7 @@ mod tests {
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: crate::StoreRegistries::default(),
+            store_reload: crate::StoreReloadHandle::default(),
             health_slot: crate::SharedHealthRegistry::default(),
         });
 
@@ -407,7 +407,7 @@ mod tests {
             registry: Arc::clone(&registry),
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: crate::StoreRegistries::default(),
+            store_reload: crate::StoreReloadHandle::default(),
             health_slot: crate::SharedHealthRegistry::default(),
         });
 
@@ -481,7 +481,7 @@ mod tests {
             registry,
             shutdown: shutdown.clone(),
             subrequest_client: test_client(),
-            store_registries: crate::StoreRegistries::default(),
+            store_reload: crate::StoreReloadHandle::default(),
             health_slot: crate::SharedHealthRegistry::default(),
         });
 

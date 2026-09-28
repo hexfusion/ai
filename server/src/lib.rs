@@ -8,7 +8,7 @@ pub(crate) mod pipelines;
 pub mod readiness;
 pub(crate) mod reload;
 mod server;
-#[cfg(feature = "store")]
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 mod store_config;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 pub mod store_provision;
@@ -26,16 +26,19 @@ pub use server::{
 pub use subrequest::create_subrequest_client;
 
 /// Per-listener response-store registries threaded through serve, reload, and
-/// pipeline resolution. The real map only when the store feature is on; a unit
-/// placeholder otherwise, so the serve and watch signatures stay feature-free.
+/// pipeline resolution.
 #[cfg(feature = "store")]
 pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>;
-/// Feature-off placeholder for [`StoreRegistries`], so serve and watch keep
-/// feature-free signatures. Not a unit struct and not `Copy`, so it trips no
-/// lint when defaulted or passed by reference.
-#[cfg(not(feature = "store"))]
+
+/// Serving-runtime command handle used to provision store generations during
+/// config reload. Backend-free builds carry a placeholder because they have no
+/// concrete factory or pool lifecycle to drive.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub(crate) type StoreReloadHandle = store_provision::StoreReloadHandle;
+/// Feature-off placeholder for [`StoreReloadHandle`].
+#[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
 #[derive(Clone, Default)]
-pub(crate) struct StoreRegistries(std::marker::PhantomData<()>);
+pub(crate) struct StoreReloadHandle(std::marker::PhantomData<()>);
 
 /// A shared, swappable handle to the current cluster health registry. Reload
 /// stores a freshly built registry here so the readiness endpoint reads current

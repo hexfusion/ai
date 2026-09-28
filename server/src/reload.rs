@@ -3,12 +3,8 @@
 
 //! Hot config reload: validate, build, and atomically swap filter pipelines.
 
-#[cfg(feature = "store")]
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "store")]
-use praxis_ai_apis::store::{CONVERSATIONS_STORE_FILTER_NAME, RESPONSE_STORE_FILTER_NAME};
 use praxis_core::{
     config::Config,
     health::{HealthRegistry, build_health_registry},
@@ -18,10 +14,8 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-#[cfg(feature = "store")]
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 use crate::pipelines::resolve_pipelines_with_stores;
-#[cfg(feature = "store")]
-use crate::store_config::find_listener_store_configs;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -59,28 +53,16 @@ pub(crate) fn reload_pipelines(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
-    store_registries: &crate::StoreRegistries,
+    store_reload: &crate::StoreReloadHandle,
     health_slot: &crate::SharedHealthRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(not(feature = "store"))]
-    let _ = store_registries;
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    let _ = store_reload;
     info!("building new pipelines from reloaded config");
 
     if let Err(e) = praxis_core::logging::validate_log_overrides(new_config) {
         error!(error = %e, "config reload failed: invalid log_overrides");
         return Err(e.into());
-    }
-
-    // A store config change is restart-required: pools bind to the serving
-    // runtime while reload runs on the watcher runtime. Reject the reload so the
-    // running pipeline keeps serving against its provisioned backends, rather
-    // than swap in one whose store registry is stale or empty and returns 500s.
-    #[cfg(feature = "store")]
-    if store_filter_configs(new_config) != store_filter_configs(old_config) {
-        error!(
-            "config reload rejected: response store configuration changed; restart required to re-provision backends"
-        );
-        return Err("response store configuration changed; restart required to re-provision".into());
     }
 
     let health_registry = build_health_registry(&new_config.clusters);
@@ -91,24 +73,61 @@ pub(crate) fn reload_pipelines(
         new_ceiling,
     );
 
-    // Reuse the serving-runtime-provisioned store registries: the reloaded
-    // pipeline shares the same backends. Store pools bind to the serving
-    // runtime, and reload runs on the watcher runtime, so a changed store
-    // config is restart-required rather than re-provisioned here.
-    #[cfg(feature = "store")]
+    // Validate the complete candidate pipeline before provisioning touches a
+    // database. Factory validation alone cannot cover cross-filter contracts or
+    // every filter-owned security check, such as SQLite path traversal.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let prepared_stores = if crate::store_provision::config_uses_store(new_config)
+        || crate::store_provision::config_uses_store(old_config)
+    {
+        let (validation_registries, _service, _reload, _readiness) =
+            crate::store_provision::build_store_wiring(new_config)?;
+        resolve_pipelines_with_stores(
+            new_config,
+            registry,
+            &health_registry,
+            kv_stores,
+            &updated_client,
+            &validation_registries,
+        )?;
+        Some(store_reload.prepare(new_config)?)
+    } else {
+        None
+    };
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let empty_store_registries = crate::StoreRegistries::default();
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
     let build = resolve_pipelines_with_stores(
         new_config,
         registry,
         &health_registry,
         kv_stores,
         &updated_client,
-        store_registries,
+        prepared_stores
+            .as_ref()
+            .map_or(&empty_store_registries, |prepared| &prepared.registries),
+    );
+    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    let build = crate::pipelines::resolve_pipelines_with_stores(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        &updated_client,
+        &crate::StoreRegistries::default(),
     );
     #[cfg(not(feature = "store"))]
     let build = crate::pipelines::resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client);
     let new_pipelines = match build {
         Ok(p) => p,
         Err(e) => {
+            #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+            if let Some(prepared) = prepared_stores
+                && let Err(abort_error) = store_reload.abort(prepared)
+            {
+                error!(error = %abort_error, "failed to release rejected store reload generation");
+            }
             error!(error = %e, "config reload failed: pipeline build error");
             return Err(e);
         },
@@ -116,6 +135,20 @@ pub(crate) fn reload_pipelines(
 
     log_restart_required_changes(old_config, new_config);
     warn_stateful_filter_reset(new_config);
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let old_pipelines = crate::store_provision::store_listener_names(old_config)
+        .into_iter()
+        .filter_map(|name| live.get(&name).map(|slot| Arc::downgrade(&slot.load_full())))
+        .collect();
+
+    // Promotion cannot fail after this acknowledgement, and the ArcSwap stores
+    // below are infallible. Commit before publication so shutdown can never
+    // classify an already-published generation as unattached pending state.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    if let Some(prepared) = prepared_stores {
+        store_reload.commit(prepared, old_pipelines)?;
+    }
 
     let mut swapped = Vec::new();
     let mut skipped = Vec::new();
@@ -198,34 +231,6 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
     detect_subrequest_connector_changes(old, new);
-}
-
-/// Collect the effective store configs bound to each listener.
-///
-/// This follows every inline and named branch chain just like startup
-/// provisioning. Listener names are the keys because each listener owns a
-/// distinct registry even when two listeners share one config.
-#[cfg(feature = "store")]
-fn store_filter_configs(config: &Config) -> BTreeMap<String, (Vec<serde_yaml::Value>, Vec<serde_yaml::Value>)> {
-    let chains: std::collections::HashMap<&str, &[praxis_core::config::FilterEntry]> = config
-        .filter_chains
-        .iter()
-        .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
-        .collect();
-
-    config
-        .listeners
-        .iter()
-        .filter_map(|listener| {
-            let responses = find_listener_store_configs(listener, &chains, RESPONSE_STORE_FILTER_NAME);
-            let conversations = find_listener_store_configs(listener, &chains, CONVERSATIONS_STORE_FILTER_NAME);
-            if responses.is_empty() && conversations.is_empty() {
-                None
-            } else {
-                Some((listener.name.clone(), (responses, conversations)))
-            }
-        })
-        .collect()
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -440,32 +445,6 @@ mod tests {
     use super::*;
     use crate::pipelines::resolve_pipelines;
 
-    #[cfg(feature = "store")]
-    #[test]
-    fn store_reload_comparison_follows_inline_branch_chains() {
-        let old = Config::from_yaml(&inline_branch_store_config("sqlite:///old.db")).unwrap();
-        let new = Config::from_yaml(&inline_branch_store_config("sqlite:///new.db")).unwrap();
-
-        assert_ne!(
-            store_filter_configs(&old),
-            store_filter_configs(&new),
-            "an inline-branch store change must require backend reprovisioning"
-        );
-    }
-
-    #[cfg(feature = "store")]
-    #[test]
-    fn store_reload_comparison_tracks_listener_chain_binding() {
-        let old = Config::from_yaml(&listener_store_binding_config("store-a")).unwrap();
-        let new = Config::from_yaml(&listener_store_binding_config("store-b")).unwrap();
-
-        assert_ne!(
-            store_filter_configs(&old),
-            store_filter_configs(&new),
-            "switching a listener between existing stores must require reprovisioning"
-        );
-    }
-
     #[test]
     fn valid_reload_swaps_pipeline() {
         let (live, old_config, registry, shutdown) = setup_live_pipelines();
@@ -480,7 +459,7 @@ mod tests {
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         );
 
@@ -516,13 +495,66 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
         let current_ptr = Arc::as_ptr(&live.get("web").unwrap().load());
         assert_eq!(old_ptr, current_ptr, "pipeline should be untouched after failure");
+    }
+
+    #[cfg(feature = "store-sqlite")]
+    #[test]
+    fn invalid_store_candidate_is_rejected_before_provisioning() {
+        let old_config = valid_config();
+        let client = test_client();
+        let registry = crate::build_full_registry(&client);
+        let health_registry: HealthRegistry = Arc::new(HashMap::new());
+        let kv_stores = empty_kv_stores();
+        let live = resolve_pipelines(&old_config, &registry, &health_registry, &kv_stores, &client)
+            .expect("initial pipelines");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = temp.path().join("outside.db");
+        let database_url = format!("sqlite://{}/allowed/../outside.db?mode=rwc", temp.path().display());
+        let new_config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+"#,
+        ))
+        .expect("candidate config");
+
+        let result = reload_pipelines(
+            &new_config,
+            &old_config,
+            &registry,
+            &live,
+            &Arc::new(Mutex::new(CancellationToken::new())),
+            &kv_stores,
+            &client,
+            &crate::StoreReloadHandle::default(),
+            &crate::SharedHealthRegistry::default(),
+        );
+
+        let error = result
+            .expect_err("path traversal must reject the candidate")
+            .to_string();
+        assert!(
+            error.contains("must not contain '..' path traversal"),
+            "unexpected error: {error}"
+        );
+        assert!(!outside.exists(), "rejected reload must not create its SQLite database");
     }
 
     #[test]
@@ -539,7 +571,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
@@ -564,7 +596,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
@@ -604,7 +636,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         );
         assert!(
@@ -643,7 +675,7 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
-            &crate::StoreRegistries::default(),
+            &crate::StoreReloadHandle::default(),
             &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
@@ -849,59 +881,6 @@ filter_chains:
 "#,
         )
         .unwrap()
-    }
-
-    #[cfg(feature = "store")]
-    fn inline_branch_store_config(database_url: &str) -> String {
-        format!(
-            r#"
-listeners:
-  - name: web
-    address: "127.0.0.1:8080"
-    filter_chains: [main]
-filter_chains:
-  - name: main
-    filters:
-      - filter: router
-        branch_chains:
-          - name: persisted
-            chains:
-              - name: inline-store
-                filters:
-                  - filter: openai_response_store
-                    backend: sqlite
-                    database_url: "{database_url}"
-                    responses_table: responses
-                    conversations_table: conversations
-"#
-        )
-    }
-
-    #[cfg(feature = "store")]
-    fn listener_store_binding_config(selected_chain: &str) -> String {
-        format!(
-            r#"
-listeners:
-  - name: web
-    address: "127.0.0.1:8080"
-    filter_chains: [{selected_chain}]
-filter_chains:
-  - name: store-a
-    filters:
-      - filter: openai_response_store
-        backend: sqlite
-        database_url: "sqlite:///a.db"
-        responses_table: responses
-        conversations_table: conversations
-  - name: store-b
-    filters:
-      - filter: openai_response_store
-        backend: sqlite
-        database_url: "sqlite:///b.db"
-        responses_table: responses
-        conversations_table: conversations
-"#
-        )
     }
 
     /// Set up live pipelines, registry, and shutdown token for reload tests.

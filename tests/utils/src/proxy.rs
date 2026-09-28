@@ -435,7 +435,7 @@ fn build_pingora_server(
     // shared registries into the pipelines, and register the service so
     // store-filter requests through the harness resolve a provisioned backend.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    let (store_registries, store_service, store_readiness) =
+    let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
     #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
     let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
@@ -471,12 +471,10 @@ fn build_pingora_server(
     }
 
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    if let Some(service) = store_service {
-        server.add_service(pingora_core::services::background::background_service(
-            "store-provision",
-            service,
-        ));
-    }
+    server.add_service(pingora_core::services::background::background_service(
+        "store-provision",
+        store_service,
+    ));
 
     (server, readiness)
 }

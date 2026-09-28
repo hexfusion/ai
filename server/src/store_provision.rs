@@ -11,7 +11,11 @@
 
 #![cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak, mpsc as std_mpsc},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::{StreamExt as _, stream::FuturesUnordered};
@@ -26,16 +30,14 @@ use praxis_ai_apis::store::{
 use praxis_ai_store::{BackendError, EffectiveConfigKey, StoreBackendFactory, StoreRegistry};
 use praxis_ai_store_lifecycle::{BackendCache, BackendLease, ProvisionError, StoreRef};
 use praxis_core::config::{Config, FilterEntry};
-use tokio::sync::watch;
+use praxis_filter::FilterPipeline;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tracing::{error, info};
 
 use crate::store_config::find_listener_store_configs;
 
-/// Initial backoff before retrying a failed provisioning attempt.
-const PROVISION_RETRY_INITIAL: Duration = Duration::from_millis(50);
-
-/// Ceiling on the backoff between provisioning retries.
-const PROVISION_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Poll interval while an old pipeline generation drains in-flight requests.
+const PIPELINE_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 /// Readiness of the configured response-store backends.
 ///
@@ -45,7 +47,8 @@ const PROVISION_RETRY_MAX: Duration = Duration::from_secs(5);
 pub enum StoreReadiness {
     /// Provisioning has not yet completed for every listener.
     Pending,
-    /// The most recent attempt failed. A retry is scheduled with backoff.
+    /// The initial generation failed terminally. A later valid reload can
+    /// provision a replacement generation without restarting the process.
     Failed,
     /// Every configured listener holds a provisioned backend.
     Ready,
@@ -83,13 +86,13 @@ impl StoreReadinessHandle {
         self.current() == StoreReadiness::Ready
     }
 
-    /// Await until every configured store is provisioned. Returns at once when
-    /// already ready, and returns if the provisioner stops without reaching
-    /// `Ready` so a caller cannot block forever.
+    /// Await until provisioning either succeeds or fails terminally. Returns at
+    /// once when already settled, and also returns if the provisioner stops so
+    /// a caller cannot block forever. Inspect [`Self::current`] for the result.
     pub async fn wait_ready(&mut self) {
-        // Err only if the sender dropped before reaching Ready. Either way, stop
+        // Err only if the sender drops while still pending. Either way, stop
         // waiting. The borrowed guard is released at once.
-        let _ready = self.rx.wait_for(|s| *s == StoreReadiness::Ready).await;
+        let _settled = self.rx.wait_for(|s| *s != StoreReadiness::Pending).await;
     }
 }
 
@@ -210,6 +213,20 @@ fn build_listener_store_plans(config: &Config) -> Vec<ListenerStorePlan> {
     plans
 }
 
+/// Whether any listener reaches a persisted-state store filter.
+pub(crate) fn config_uses_store(config: &Config) -> bool {
+    !build_listener_store_plans(config).is_empty()
+}
+
+/// Listener names whose live pipelines can hold references to a store
+/// generation built from `config`.
+pub(crate) fn store_listener_names(config: &Config) -> Vec<String> {
+    build_listener_store_plans(config)
+        .into_iter()
+        .map(|plan| plan.listener)
+        .collect()
+}
+
 /// Reject one listener binding a registry name to different effective backend
 /// configurations, then collapse repeated references to the same backend.
 #[expect(
@@ -274,11 +291,12 @@ fn registries_map(plans: &[ListenerStorePlan]) -> HashMap<String, ResponseStoreR
         .collect()
 }
 
-/// The per-listener registries to install into pipelines, the provisioner when
-/// any store is configured, and a readiness handle observers await.
+/// The per-listener registries to install into pipelines, the serving-runtime
+/// provisioner, its reload handle, and a readiness handle observers await.
 pub type StoreWiring = (
     HashMap<String, ResponseStoreRegistry>,
-    Option<StoreProvisionService>,
+    StoreProvisionService,
+    StoreReloadHandle,
     StoreReadinessHandle,
 );
 
@@ -300,153 +318,326 @@ pub fn build_store_wiring(config: &Config) -> Result<StoreWiring, ProvisionError
     let factories = store_backend_factories();
     validate_and_deduplicate_refs(&mut plans, &factories)?;
     let registries = registries_map(&plans);
-    if plans.is_empty() {
-        return Ok((registries, None, StoreReadinessHandle::ready()));
-    }
-    let cache = Arc::new(BackendCache::new(factories));
+    let cache = Arc::new(BackendCache::new(factories.clone()));
     let refs: Vec<StoreRef> = plans.iter().flat_map(|p| p.refs.iter().cloned()).collect();
     cache.validate(&refs)?;
-    let (readiness, rx) = watch::channel(StoreReadiness::Pending);
+    let initial_readiness = if plans.is_empty() {
+        StoreReadiness::Ready
+    } else {
+        StoreReadiness::Pending
+    };
+    let (readiness, rx) = watch::channel(initial_readiness);
+    let (commands, command_rx) = mpsc::unbounded_channel();
     Ok((
         registries,
-        Some(StoreProvisionService {
+        StoreProvisionService {
             cache,
+            factories,
             plans,
             readiness,
-        }),
+            commands: AsyncMutex::new(Some(command_rx)),
+        },
+        StoreReloadHandle { commands },
         StoreReadinessHandle { rx },
     ))
 }
 
-/// Provisions response-store backends on the serving runtime and holds their
-/// leases for the process lifetime.
+/// A store generation provisioned on the serving runtime but not yet installed
+/// into the live pipelines.
+pub(crate) struct PreparedStoreReload {
+    /// Monotonic generation identifier owned by the provisioner.
+    generation: u64,
+    /// Ready registries to attach while building the replacement pipelines.
+    pub(crate) registries: crate::StoreRegistries,
+}
+
+/// Cloneable command handle used by the config-watcher thread.
+///
+/// Commands cross onto the serving runtime before touching SQL pools. The
+/// watcher waits synchronously because it must not swap a pipeline until its
+/// replacement generation is fully provisioned.
+#[derive(Clone)]
+pub struct StoreReloadHandle {
+    /// Commands consumed by [`StoreProvisionService`].
+    commands: mpsc::UnboundedSender<StoreCommand>,
+}
+
+impl Default for StoreReloadHandle {
+    fn default() -> Self {
+        let (commands, _receiver) = mpsc::unbounded_channel();
+        Self { commands }
+    }
+}
+
+impl StoreReloadHandle {
+    /// Provision and validate a replacement store generation.
+    pub(crate) fn prepare(&self, config: &Config) -> Result<PreparedStoreReload, String> {
+        let (reply, response) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(StoreCommand::Prepare {
+                config: Box::new(config.clone()),
+                reply,
+            })
+            .map_err(|_send_error| "store provisioner stopped before reload preparation".to_owned())?;
+        response
+            .recv()
+            .map_err(|_recv_error| "store provisioner dropped the reload preparation response".to_owned())?
+    }
+
+    /// Promote a prepared generation immediately before the replacement
+    /// pipelines are published.
+    pub(crate) fn commit(
+        &self,
+        prepared: PreparedStoreReload,
+        old_pipelines: Vec<Weak<FilterPipeline>>,
+    ) -> Result<(), String> {
+        let PreparedStoreReload { generation, registries } = prepared;
+        drop(registries);
+        let (reply, response) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(StoreCommand::Commit {
+                generation,
+                old_pipelines,
+                reply,
+            })
+            .map_err(|_send_error| "store provisioner stopped before reload commit".to_owned())?;
+        response
+            .recv()
+            .map_err(|_recv_error| "store provisioner dropped the reload commit response".to_owned())?
+    }
+
+    /// Release a prepared generation whose pipeline build failed.
+    pub(crate) fn abort(&self, prepared: PreparedStoreReload) -> Result<(), String> {
+        let PreparedStoreReload { generation, registries } = prepared;
+        drop(registries);
+        let (reply, response) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(StoreCommand::Abort { generation, reply })
+            .map_err(|_send_error| "store provisioner stopped before reload abort".to_owned())?;
+        response
+            .recv()
+            .map_err(|_recv_error| "store provisioner dropped the reload abort response".to_owned())?
+    }
+}
+
+/// Commands sent from the watcher runtime to the serving runtime.
+enum StoreCommand {
+    /// Build a candidate generation without disturbing the active one.
+    Prepare {
+        /// Reloaded proxy configuration.
+        config: Box<Config>,
+        /// Completion sent after provisioning succeeds or fails.
+        reply: std_mpsc::SyncSender<Result<PreparedStoreReload, String>>,
+    },
+    /// Make a prepared generation active after pipeline swap.
+    Commit {
+        /// Prepared generation identifier.
+        generation: u64,
+        /// Weak observers of previous pipelines whose request-held `Arc`s must
+        /// drain. Weak references cannot keep each other alive across reloads.
+        old_pipelines: Vec<Weak<FilterPipeline>>,
+        /// Completion acknowledgement.
+        reply: std_mpsc::SyncSender<Result<(), String>>,
+    },
+    /// Discard a prepared generation after pipeline construction failed.
+    Abort {
+        /// Prepared generation identifier.
+        generation: u64,
+        /// Completion acknowledgement.
+        reply: std_mpsc::SyncSender<Result<(), String>>,
+    },
+}
+
+/// Provisions response-store backends on the serving runtime and owns every
+/// active or pending generation lease.
 pub struct StoreProvisionService {
     /// Process-wide backend cache built from the compiled-in factories.
     cache: Arc<BackendCache>,
+    /// Factories used to validate and de-duplicate reload plans.
+    factories: Vec<Arc<dyn StoreBackendFactory>>,
     /// Per-listener registries and references to provision.
     plans: Vec<ListenerStorePlan>,
     /// Publishes readiness transitions to observers.
     readiness: watch::Sender<StoreReadiness>,
-}
-
-/// Terminal result from one listener's independent provisioning worker.
-enum ListenerProvisionOutcome {
-    /// The listener owns a live backend lease.
-    Provisioned(BackendLease),
-    /// The listener configuration cannot succeed without a restart.
-    PermanentFailure,
-    /// Shutdown arrived between attempts.
-    Shutdown,
+    /// Single receiver taken when the background service starts.
+    commands: AsyncMutex<Option<mpsc::UnboundedReceiver<StoreCommand>>>,
 }
 
 impl StoreProvisionService {
-    /// Provision one listener, with a retry clock independent of every sibling.
+    /// Validate one config and construct its fresh per-listener registries.
+    fn prepare_plans(&self, config: &Config) -> Result<Vec<ListenerStorePlan>, ProvisionError> {
+        let mut plans = build_listener_store_plans(config);
+        validate_and_deduplicate_refs(&mut plans, &self.factories)?;
+        let refs: Vec<StoreRef> = plans.iter().flat_map(|p| p.refs.iter().cloned()).collect();
+        self.cache.validate(&refs)?;
+        Ok(plans)
+    }
+
+    /// Provision all listeners concurrently as one atomic generation.
+    ///
+    /// [`BackendCache`] already applies the bounded transient retry budget. Any
+    /// error returned here, including [`BackendError::Unavailable`], is terminal
+    /// for this generation and must not be retried by the server.
     #[expect(
-        clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "retry classification, logging, and cancellation form one listener lifecycle"
+        reason = "concurrent provisioning, rollback, and atomic publication form one operation"
     )]
-    async fn provision_listener(
-        &self,
-        plan: &ListenerStorePlan,
-        mut shutdown: ShutdownWatch,
-    ) -> ListenerProvisionOutcome {
-        let mut backoff = PROVISION_RETRY_INITIAL;
-        loop {
-            match self.cache.provision_into(&plan.refs, &plan.registry).await {
+    async fn provision_all(&self, plans: &[ListenerStorePlan]) -> Result<Vec<BackendLease>, ProvisionError> {
+        let mut workers = plans
+            .iter()
+            .map(|plan| async move {
+                let result = self.cache.provision_into(&plan.refs, &plan.registry).await;
+                (plan, result)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut leases = Vec::with_capacity(plans.len());
+        let mut failure = None;
+
+        while let Some((plan, result)) = workers.next().await {
+            match result {
                 Ok(lease) => {
                     info!(listener = %plan.listener, "persisted-state stores provisioned");
-                    plan.registry.mark_ready();
-                    return ListenerProvisionOutcome::Provisioned(lease);
+                    leases.push(lease);
                 },
                 Err(e) => {
-                    let _sent = self.readiness.send(StoreReadiness::Failed);
-                    if matches!(
-                        e,
-                        ProvisionError::UnknownBackend { .. }
-                            | ProvisionError::Backend {
-                                source: BackendError::Config(_),
-                                ..
-                            }
-                    ) {
-                        error!(
-                            listener = %plan.listener,
-                            error = %e,
-                            "response store provisioning failed permanently; not retrying",
-                        );
-                        return ListenerProvisionOutcome::PermanentFailure;
-                    }
                     error!(
                         listener = %plan.listener,
                         error = %e,
-                        backoff_ms = backoff.as_millis(),
-                        "response store provisioning failed; retrying",
+                        "response store provisioning failed permanently; not retrying",
                     );
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
                 },
             }
-            tokio::select! {
-                () = tokio::time::sleep(backoff) => {},
-                _ = shutdown.changed() => return ListenerProvisionOutcome::Shutdown,
-            }
-            backoff = backoff.saturating_mul(2).min(PROVISION_RETRY_MAX);
-        }
-    }
-
-    /// Run one independent worker per listener and retain every successful lease.
-    async fn provision_all(&self, leases: &mut Vec<BackendLease>, shutdown: &mut ShutdownWatch) -> bool {
-        let mut workers = self
-            .plans
-            .iter()
-            .map(|plan| {
-                let listener_shutdown = shutdown.clone();
-                async move { self.provision_listener(plan, listener_shutdown).await }
-            })
-            .collect::<FuturesUnordered<_>>();
-        let mut permanent_failure = false;
-
-        while let Some(outcome) = workers.next().await {
-            match outcome {
-                ListenerProvisionOutcome::Provisioned(lease) => leases.push(lease),
-                ListenerProvisionOutcome::PermanentFailure => permanent_failure = true,
-                ListenerProvisionOutcome::Shutdown => return false,
-            }
         }
 
-        if permanent_failure {
-            // Healthy listeners remain usable even though aggregate readiness
-            // cannot become Ready. Keep their leases until request draining.
-            let _changed = shutdown.changed().await;
-            return false;
+        if let Some(error) = failure {
+            release_leases(leases).await;
+            return Err(error);
         }
-        true
+
+        for plan in plans {
+            plan.registry.mark_ready();
+        }
+        Ok(leases)
     }
 }
 
 #[async_trait]
 impl BackgroundService for StoreProvisionService {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup and reload commands share one serving-runtime lease owner"
+    )]
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let mut leases: Vec<BackendLease> = Vec::with_capacity(self.plans.len());
-        // Signal Ready only once every listener holds a lease, so observers never
-        // see a partially provisioned instance as ready.
-        if !self.provision_all(&mut leases, &mut shutdown).await {
-            // Aggregate readiness does not prevent an independently healthy
-            // listener from serving. As on the Ready path, leave its backend
-            // alive until the serving runtime has drained requests and drops.
+        let Some(mut commands) = self.commands.lock().await.take() else {
+            error!("store provisioner command receiver was already taken");
             return;
+        };
+        let initial_provisioning = self.provision_all(&self.plans);
+        tokio::pin!(initial_provisioning);
+        let initial_result = tokio::select! {
+            result = &mut initial_provisioning => result,
+            _ = shutdown.changed() => return,
+        };
+        let mut active_leases = if let Ok(leases) = initial_result {
+            let _sent = self.readiness.send(StoreReadiness::Ready);
+            if !self.plans.is_empty() {
+                info!("all persisted-state stores provisioned");
+            }
+            leases
+        } else {
+            let _sent = self.readiness.send(StoreReadiness::Failed);
+            Vec::new()
+        };
+        let mut pending: HashMap<u64, Vec<BackendLease>> = HashMap::new();
+        let mut next_generation = 1_u64;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        StoreCommand::Prepare { config, reply } => {
+                            let result = match self.prepare_plans(&config) {
+                                Ok(plans) => {
+                                    let provisioning = self.provision_all(&plans);
+                                    tokio::pin!(provisioning);
+                                    let provisioned = tokio::select! {
+                                        result = &mut provisioning => result,
+                                        _ = shutdown.changed() => {
+                                            let _sent = reply.send(Err(
+                                                "store provisioner stopped during reload preparation".to_owned(),
+                                            ));
+                                            break;
+                                        },
+                                    };
+                                    match provisioned {
+                                        Ok(leases) => {
+                                            let generation = next_generation;
+                                            next_generation = next_generation.saturating_add(1);
+                                            let registries = registries_map(&plans);
+                                            pending.insert(generation, leases);
+                                            Ok(PreparedStoreReload { generation, registries })
+                                        },
+                                        Err(e) => Err(e.to_string()),
+                                    }
+                                },
+                                Err(e) => Err(e.to_string()),
+                            };
+                            let _sent = reply.send(result);
+                        },
+                        StoreCommand::Commit { generation, old_pipelines, reply } => {
+                            let result = if let Some(new_leases) = pending.remove(&generation) {
+                                let old_leases = std::mem::replace(&mut active_leases, new_leases);
+                                tokio::spawn(release_after_drain(old_pipelines, old_leases));
+                                let _sent = self.readiness.send(StoreReadiness::Ready);
+                                Ok(())
+                            } else {
+                                Err(format!("unknown prepared store generation {generation}"))
+                            };
+                            let _sent = reply.send(result);
+                        },
+                        StoreCommand::Abort { generation, reply } => {
+                            let result = if let Some(leases) = pending.remove(&generation) {
+                                release_leases(leases).await;
+                                Ok(())
+                            } else {
+                                Err(format!("unknown prepared store generation {generation}"))
+                            };
+                            let _sent = reply.send(result);
+                        },
+                    }
+                },
+            }
         }
 
-        let _sent = self.readiness.send(StoreReadiness::Ready);
-        info!("all persisted-state stores provisioned");
-        let _changed = shutdown.changed().await;
-
-        // Pingora broadcasts shutdown before its grace period and in-flight
-        // request drain. Do not call BackendLease::release here: retiring a SQL
-        // backend closes its pool and would break requests still persisting
-        // state. Dropping these lease handles leaves their cache refcounts
-        // intact; the service-owned cache, backends, and pools then drop with
-        // the serving runtime after request draining completes. The lease
-        // handles now fall out of scope without invoking async retirement.
+        // Pending generations were never attached to request paths and can be
+        // retired immediately. Active leases intentionally remain held through
+        // Pingora's shutdown drain and disappear with the serving runtime.
+        for (_, leases) in pending {
+            release_leases(leases).await;
+        }
+        drop(active_leases);
     }
+}
+
+/// Release every lease in a generation on the serving runtime.
+async fn release_leases(leases: Vec<BackendLease>) {
+    for lease in leases {
+        lease.release().await;
+    }
+}
+
+/// Retain the old backend generation until every pipeline owner and request-held
+/// `Arc` has drained, then retire backends no newer generation references.
+async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: Vec<BackendLease>) {
+    while old_pipelines.iter().any(|pipeline| pipeline.strong_count() > 0) {
+        tokio::time::sleep(PIPELINE_DRAIN_POLL).await;
+    }
+    release_leases(leases).await;
 }
 
 #[cfg(test)]
@@ -458,6 +649,7 @@ mod tests {
     use praxis_ai_store::{
         BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory, memory::InMemoryStore,
     };
+    use praxis_filter::FilterRegistry;
     use serde_json::json;
 
     use super::*;
@@ -513,27 +705,57 @@ mod tests {
         }
     }
 
-    struct SlowUnavailableFactory;
-
-    #[async_trait]
-    impl StoreBackendFactory for SlowUnavailableFactory {
-        fn backend_id(&self) -> &str {
-            "slow-unavailable"
-        }
-
-        fn effective_key(&self, _config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
-            Ok(EffectiveConfigKey::new("slow-unavailable"))
-        }
-
-        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            Err(BackendError::Unavailable("test backend is slow and down".to_owned()))
-        }
-    }
-
     struct RecoveringFactory {
         builds: Arc<AtomicUsize>,
         retires: Arc<AtomicUsize>,
+    }
+
+    struct HangingFactory {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    struct ReloadFactory {
+        builds: Arc<AtomicUsize>,
+        retires: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for HangingFactory {
+        fn backend_id(&self) -> &str {
+            "hanging"
+        }
+
+        fn effective_key(&self, _config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            Ok(EffectiveConfigKey::new("hanging"))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl StoreBackendFactory for ReloadFactory {
+        fn backend_id(&self) -> &str {
+            "reload"
+        }
+
+        fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError> {
+            let url = config
+                .get("database_url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| BackendError::Config("missing database_url".to_owned()))?;
+            Ok(EffectiveConfigKey::new(url))
+        }
+
+        async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(ProvisionedBackend {
+                backend: Arc::new(InMemoryStore::new()),
+                retire: Arc::new(CountingRetire(Arc::clone(&self.retires))),
+            })
+        }
     }
 
     #[async_trait]
@@ -548,10 +770,8 @@ mod tests {
 
         async fn build(&self, _config: &serde_json::Value) -> Result<ProvisionedBackend, BackendError> {
             let attempt = self.builds.fetch_add(1, Ordering::SeqCst);
-            if attempt < 3 {
-                return Err(BackendError::Unavailable(
-                    "test backend has not recovered yet".to_owned(),
-                ));
+            if attempt < 2 {
+                return Err(BackendError::Transient("test backend has not recovered yet".to_owned()));
             }
             Ok(ProvisionedBackend {
                 backend: Arc::new(InMemoryStore::new()),
@@ -595,6 +815,66 @@ filter_chains:
         .expect("conditional store config")
     }
 
+    fn single_store_config(backend: &str, database_url: &str) -> Config {
+        Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: {backend}
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+"#
+        ))
+        .expect("single store config")
+    }
+
+    #[test]
+    fn store_listener_names_exclude_stateless_listeners() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: stateful
+    address: "127.0.0.1:8080"
+    filter_chains: [store]
+  - name: stateless
+    address: "127.0.0.1:8081"
+    filter_chains: [plain]
+filter_chains:
+  - name: store
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+  - name: plain
+    filters: []
+"#,
+        )
+        .expect("mixed listener config");
+
+        assert_eq!(store_listener_names(&config), ["stateful"]);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_returns_after_terminal_failure() {
+        let (readiness, rx) = watch::channel(StoreReadiness::Pending);
+        let mut handle = StoreReadinessHandle { rx };
+
+        readiness.send(StoreReadiness::Failed).expect("readiness observer");
+        tokio::time::timeout(Duration::from_millis(100), handle.wait_ready())
+            .await
+            .expect("terminal provisioning failure must unblock readiness waiters");
+        assert_eq!(handle.current(), StoreReadiness::Failed);
+    }
+
     #[test]
     fn conflicting_conditional_store_configs_are_rejected() {
         #[cfg(feature = "store-sqlite")]
@@ -629,10 +909,9 @@ filter_chains:
             "postgresql://user:password@8.8.8.8/store",
             "postgresql://user:password@8.8.8.8/store",
         );
-        let (registries, provisioner, _readiness) = build_store_wiring(&config).expect("identical stores");
+        let (registries, provisioner, _reload, _readiness) = build_store_wiring(&config).expect("identical stores");
 
         assert_eq!(registries.len(), 1);
-        let provisioner = provisioner.expect("store provisioner");
         assert_eq!(provisioner.plans.len(), 1);
         assert_eq!(provisioner.plans.first().expect("listener plan").refs.len(), 1);
     }
@@ -681,8 +960,10 @@ filter_chains:
         let cache = Arc::new(BackendCache::new(vec![factory]));
         let registry = StoreRegistry::new();
         let (readiness, mut readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
         let service = Arc::new(StoreProvisionService {
             cache,
+            factories: Vec::new(),
             plans: vec![ListenerStorePlan {
                 listener: "web".to_owned(),
                 registry,
@@ -693,6 +974,7 @@ filter_chains:
                 }],
             }],
             readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let running = tokio::spawn({
@@ -715,7 +997,7 @@ filter_chains:
     }
 
     #[tokio::test]
-    async fn failed_listener_does_not_starve_a_later_healthy_listener() {
+    async fn permanent_failure_is_not_retried_or_partially_published() {
         let builds = Arc::new(AtomicUsize::new(0));
         let retires = Arc::new(AtomicUsize::new(0));
         let factories: Vec<Arc<dyn StoreBackendFactory>> = vec![
@@ -728,13 +1010,15 @@ filter_chains:
         ];
         let failed_registry = StoreRegistry::new();
         let healthy_registry = StoreRegistry::new();
-        let (readiness, readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (readiness, mut readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
         let service = Arc::new(StoreProvisionService {
             cache: Arc::new(BackendCache::new(factories)),
+            factories: Vec::new(),
             plans: vec![
                 ListenerStorePlan {
                     listener: "failed".to_owned(),
-                    registry: failed_registry,
+                    registry: failed_registry.clone(),
                     refs: vec![StoreRef {
                         name: Arc::from("default"),
                         backend_id: Arc::from("unavailable"),
@@ -752,6 +1036,7 @@ filter_chains:
                 },
             ],
             readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let running = tokio::spawn({
@@ -759,114 +1044,58 @@ filter_chains:
             async move { service.start(shutdown_rx).await }
         });
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !healthy_registry.is_ready() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            readiness_rx.wait_for(|state| *state == StoreReadiness::Failed),
+        )
         .await
-        .expect("healthy listener should be provisioned despite the earlier failure");
-        assert!(builds.load(Ordering::SeqCst) > 0);
-        assert_eq!(*readiness_rx.borrow(), StoreReadiness::Failed);
+        .expect("permanent failure should be published")
+        .expect("provisioner should remain alive for a correcting reload");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "terminal unavailable failures must not be retried by the server"
+        );
+        assert!(!failed_registry.is_ready());
+        assert!(
+            !healthy_registry.is_ready(),
+            "a failed generation must not publish partially"
+        );
 
         shutdown_tx.send(true).expect("service should still receive shutdown");
         running.await.expect("provisioner task should stop");
-        assert_eq!(retires.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            retires.load(Ordering::SeqCst),
+            1,
+            "a successfully provisioned sibling must be retired when the generation fails"
+        );
     }
 
     #[tokio::test]
-    async fn slow_listener_does_not_delay_a_later_healthy_listener() {
-        let retires = Arc::new(AtomicUsize::new(0));
-        let factories: Vec<Arc<dyn StoreBackendFactory>> = vec![
-            Arc::new(SlowUnavailableFactory),
-            Arc::new(FakeFactory {
-                retires: Arc::clone(&retires),
-            }),
-        ];
-        let healthy_registry = StoreRegistry::new();
-        let (readiness, _readiness_rx) = watch::channel(StoreReadiness::Pending);
-        let service = Arc::new(StoreProvisionService {
-            cache: Arc::new(BackendCache::new(factories)),
-            plans: vec![
-                ListenerStorePlan {
-                    listener: "slow".to_owned(),
-                    registry: StoreRegistry::new(),
-                    refs: vec![StoreRef {
-                        name: Arc::from("default"),
-                        backend_id: Arc::from("slow-unavailable"),
-                        config: json!({}),
-                    }],
-                },
-                ListenerStorePlan {
-                    listener: "healthy".to_owned(),
-                    registry: healthy_registry.clone(),
-                    refs: vec![StoreRef {
-                        name: Arc::from("default"),
-                        backend_id: Arc::from("fake"),
-                        config: json!({}),
-                    }],
-                },
-            ],
-            readiness,
-        });
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let running = tokio::spawn({
-            let service = Arc::clone(&service);
-            async move { service.start(shutdown_rx).await }
-        });
-
-        tokio::time::timeout(Duration::from_millis(200), async {
-            while !healthy_registry.is_ready() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("healthy listener should not wait for the slow listener's factory retries");
-
-        shutdown_tx.send(true).expect("service should still receive shutdown");
-        tokio::time::timeout(Duration::from_secs(2), running)
-            .await
-            .expect("slow attempt should finish within its bounded test delay")
-            .expect("provisioner task should stop");
-        assert_eq!(retires.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn recovered_listener_retries_while_a_sibling_attempt_is_still_pending() {
+    async fn transient_failure_recovers_within_cache_retry_budget() {
         let builds = Arc::new(AtomicUsize::new(0));
         let retires = Arc::new(AtomicUsize::new(0));
-        let factories: Vec<Arc<dyn StoreBackendFactory>> = vec![
-            Arc::new(SlowUnavailableFactory),
-            Arc::new(RecoveringFactory {
-                builds: Arc::clone(&builds),
-                retires: Arc::clone(&retires),
-            }),
-        ];
+        let factories: Vec<Arc<dyn StoreBackendFactory>> = vec![Arc::new(RecoveringFactory {
+            builds: Arc::clone(&builds),
+            retires: Arc::clone(&retires),
+        })];
         let recovered_registry = StoreRegistry::new();
         let (readiness, _readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (_commands, command_rx) = mpsc::unbounded_channel();
         let service = Arc::new(StoreProvisionService {
             cache: Arc::new(BackendCache::new(factories)),
-            plans: vec![
-                ListenerStorePlan {
-                    listener: "slow".to_owned(),
-                    registry: StoreRegistry::new(),
-                    refs: vec![StoreRef {
-                        name: Arc::from("default"),
-                        backend_id: Arc::from("slow-unavailable"),
-                        config: json!({}),
-                    }],
-                },
-                ListenerStorePlan {
-                    listener: "recovering".to_owned(),
-                    registry: recovered_registry.clone(),
-                    refs: vec![StoreRef {
-                        name: Arc::from("default"),
-                        backend_id: Arc::from("recovering"),
-                        config: json!({}),
-                    }],
-                },
-            ],
+            factories: Vec::new(),
+            plans: vec![ListenerStorePlan {
+                listener: "recovering".to_owned(),
+                registry: recovered_registry.clone(),
+                refs: vec![StoreRef {
+                    name: Arc::from("default"),
+                    backend_id: Arc::from("recovering"),
+                    config: json!({}),
+                }],
+            }],
             readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let running = tokio::spawn({
@@ -880,14 +1109,184 @@ filter_chains:
             }
         })
         .await
-        .expect("recovered listener should honor its retry clock while its sibling is pending");
-        assert!(builds.load(Ordering::SeqCst) >= 4);
+        .expect("transient failure should recover within the cache retry budget");
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
 
         shutdown_tx.send(true).expect("service should still receive shutdown");
-        tokio::time::timeout(Duration::from_secs(2), running)
-            .await
-            .expect("slow attempt should finish within its bounded test delay")
-            .expect("provisioner task should stop");
+        running.await.expect("provisioner task should stop");
         assert_eq!(retires.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_reload_preparation_and_unblocks_watcher() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(HangingFactory {
+            entered: Arc::clone(&entered),
+        });
+        let (readiness, _readiness_rx) = watch::channel(StoreReadiness::Ready);
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let handle = StoreReloadHandle { commands };
+        let service = Arc::new(StoreProvisionService {
+            cache: Arc::new(BackendCache::new(vec![Arc::clone(&factory)])),
+            factories: vec![factory],
+            plans: Vec::new(),
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+        let config = single_store_config("hanging", "unused");
+        let preparing = tokio::task::spawn_blocking(move || handle.prepare(&config));
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("replacement provisioning should start");
+        shutdown_tx.send(true).expect("service should receive shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(1), preparing)
+            .await
+            .expect("watcher must not remain blocked by backend initialization")
+            .expect("prepare task");
+        assert!(result.is_err(), "shutdown must reject the pending reload");
+        let error = result.err().expect("error checked above");
+        assert!(error.contains("stopped during reload preparation"));
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("provisioner should stop promptly")
+            .expect("provisioner task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_builds_swaps_drains_and_retires_store_generation() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let retires = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReloadFactory {
+            builds: Arc::clone(&builds),
+            retires: Arc::clone(&retires),
+        });
+        let factories = vec![Arc::clone(&factory)];
+        let initial_config = single_store_config("reload", "initial");
+        let mut plans = build_listener_store_plans(&initial_config);
+        validate_and_deduplicate_refs(&mut plans, &factories).expect("initial plans");
+        let cache = Arc::new(BackendCache::new(factories.clone()));
+        let (readiness, mut readiness_rx) = watch::channel(StoreReadiness::Pending);
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let handle = StoreReloadHandle { commands };
+        let service = Arc::new(StoreProvisionService {
+            cache,
+            factories,
+            plans,
+            readiness,
+            commands: AsyncMutex::new(Some(command_rx)),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let running = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.start(shutdown_rx).await }
+        });
+
+        readiness_rx
+            .wait_for(|state| *state == StoreReadiness::Ready)
+            .await
+            .expect("initial generation should become ready");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        let next_config = single_store_config("reload", "replacement");
+        let prepared = tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.prepare(&next_config)
+        })
+        .await
+        .expect("prepare task")
+        .expect("replacement generation should provision");
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(
+            prepared
+                .registries
+                .get("web")
+                .is_some_and(ResponseStoreRegistry::is_ready),
+            "replacement registry must be ready before pipeline swap"
+        );
+
+        let registry = FilterRegistry::with_builtins();
+        let mut entries = [];
+        let old_pipeline = Arc::new(FilterPipeline::build(&mut entries, &registry).expect("old pipeline"));
+        let in_flight = Arc::clone(&old_pipeline);
+        let old_pipeline_observer = Arc::downgrade(&old_pipeline);
+        tokio::task::spawn_blocking({
+            let handle = handle.clone();
+            move || handle.commit(prepared, vec![old_pipeline_observer])
+        })
+        .await
+        .expect("commit task")
+        .expect("replacement generation should commit");
+        drop(old_pipeline);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            retires.load(Ordering::SeqCst),
+            0,
+            "old backend must remain live while an in-flight request holds its pipeline"
+        );
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while retires.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old backend should retire after request drain");
+
+        shutdown_tx.send(true).expect("service should still receive shutdown");
+        running.await.expect("provisioner task should stop");
+        assert_eq!(
+            retires.load(Ordering::SeqCst),
+            1,
+            "active generation retires after runtime drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_drain_observers_do_not_keep_a_pipeline_alive() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let retires = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn StoreBackendFactory> = Arc::new(ReloadFactory {
+            builds,
+            retires: Arc::clone(&retires),
+        });
+        let cache = BackendCache::new(vec![factory]);
+        let first = cache
+            .provision(&[StoreRef {
+                name: Arc::from("default"),
+                backend_id: Arc::from("reload"),
+                config: json!({"database_url": "first"}),
+            }])
+            .await
+            .expect("first generation");
+        let second = cache
+            .provision(&[StoreRef {
+                name: Arc::from("default"),
+                backend_id: Arc::from("reload"),
+                config: json!({"database_url": "second"}),
+            }])
+            .await
+            .expect("second generation");
+
+        let registry = FilterRegistry::with_builtins();
+        let pipeline = Arc::new(FilterPipeline::build(&mut [], &registry).expect("pipeline"));
+        let observer = Arc::downgrade(&pipeline);
+        let first_release = tokio::spawn(release_after_drain(vec![Weak::clone(&observer)], vec![first.lease]));
+        let second_release = tokio::spawn(release_after_drain(vec![observer], vec![second.lease]));
+
+        drop(pipeline);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_release.await.expect("first release task");
+            second_release.await.expect("second release task");
+        })
+        .await
+        .expect("weak observers must not block one another");
+        assert_eq!(retires.load(Ordering::SeqCst), 2);
     }
 }

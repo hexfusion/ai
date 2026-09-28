@@ -74,7 +74,7 @@ RUN mkdir -p store/src store-lifecycle/src store-backends/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}"
+    cargo build --release -p praxis-ai-proxy --no-default-features --features "${PRAXIS_AI_FEATURES}"
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -102,7 +102,7 @@ RUN find store/src store-lifecycle/src store-backends/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}" \
+    cargo build --release -p praxis-ai-proxy --no-default-features --features "${PRAXIS_AI_FEATURES}" \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------

@@ -154,9 +154,9 @@ struct ServerState {
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
     health_shutdown: Arc<Mutex<CancellationToken>>,
-    /// Per-listener response-store registries, threaded through reloads so a
-    /// reloaded pipeline keeps the serving-runtime-provisioned backends.
-    store_registries: crate::StoreRegistries,
+    /// Command handle that provisions replacement generations on the serving
+    /// runtime before the watcher swaps pipelines.
+    store_reload: crate::StoreReloadHandle,
     /// Shared handle to the current cluster health registry, updated on reload so
     /// the readiness endpoint never reads a stale startup snapshot.
     health_slot: crate::SharedHealthRegistry,
@@ -185,10 +185,12 @@ fn build_server_state(
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    let (store_registries, store_service, store_readiness) =
+    let (store_registries, store_service, store_reload, store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
     let store_registries = crate::StoreRegistries::default();
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    let store_reload = crate::StoreReloadHandle::default();
 
     #[cfg(feature = "store")]
     let pipelines = crate::pipelines::resolve_pipelines_with_stores(
@@ -220,10 +222,10 @@ fn build_server_state(
         kv_stores,
         subrequest_client,
         health_shutdown,
-        store_registries,
+        store_reload,
         health_slot,
         #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-        store_service,
+        store_service: Some(store_service),
         #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
         store_readiness,
     }
@@ -275,7 +277,7 @@ fn spawn_watcher(
         registry: Arc::new(registry),
         shutdown: CancellationToken::new(),
         subrequest_client: state.subrequest_client,
-        store_registries: state.store_registries,
+        store_reload: state.store_reload,
         health_slot: state.health_slot,
     });
     Some(handle)

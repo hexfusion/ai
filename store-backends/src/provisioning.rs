@@ -11,16 +11,26 @@
 //! the pool on retirement.
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+use std::time::Duration;
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use praxis_ai_store::BackendError;
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use super::redact_connection_error;
 
 /// A permanent build failure, redacted, as a backend-unavailable error.
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn permanent(url: &str, message: &str) -> BackendError {
     BackendError::Unavailable(redact_connection_error(url, message))
 }
+
+/// Maximum time one backend may spend opening its pool and preparing schemas.
+///
+/// Pool acquisition timeouts do not bound a schema statement waiting on a
+/// database lock, so provisioning needs its own end-to-end deadline.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+const BACKEND_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A transient build failure, redacted, so provisioning retries within budget.
 #[cfg(feature = "postgres")]
@@ -78,7 +88,7 @@ mod sqlite {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::{BackendError, permanent};
+    use super::{BACKEND_INITIALIZATION_TIMEOUT, BackendError, permanent};
     use crate::SqliteResponseStore;
 
     /// Backend id the SQLite factory answers to.
@@ -153,15 +163,19 @@ mod sqlite {
             let cfg = Self::parse(config)?;
             let url = cfg.database_url.expose_secret();
             // SQLite init failure is permanent: fail the build unavailable.
-            let store = SqliteResponseStore::new(
-                url,
-                &cfg.responses_table,
-                &cfg.conversations_table,
-                cfg.items_table.as_deref(),
-                cfg.pool.as_ref(),
-                cfg.compression.as_ref(),
+            let store = tokio::time::timeout(
+                BACKEND_INITIALIZATION_TIMEOUT,
+                SqliteResponseStore::new(
+                    url,
+                    &cfg.responses_table,
+                    &cfg.conversations_table,
+                    cfg.items_table.as_deref(),
+                    cfg.pool.as_ref(),
+                    cfg.compression.as_ref(),
+                ),
             )
             .await
+            .map_err(|_elapsed| permanent(url, "backend initialization timed out after 30 seconds"))?
             .map_err(|e| permanent(url, &e.to_string()))?;
 
             let store = Arc::new(store);
@@ -189,7 +203,7 @@ mod postgres {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::{BackendError, transient};
+    use super::{BACKEND_INITIALIZATION_TIMEOUT, BackendError, permanent, transient};
     use crate::{PgTlsConfig, PostgresResponseStore, postgres_url};
 
     /// Backend id the Postgres factory answers to.
@@ -293,16 +307,20 @@ mod postgres {
             // Same fail-closed TLS/auth check the filter runs, before the pool opens.
             tls.validate(BACKEND_ID, url)
                 .map_err(|e| BackendError::Config(e.to_string()))?;
-            Box::pin(PostgresResponseStore::new(
-                url,
-                &cfg.responses_table,
-                &cfg.conversations_table,
-                cfg.items_table.as_deref(),
-                &tls,
-                cfg.pool.as_ref(),
-                cfg.compression.as_ref(),
-            ))
+            tokio::time::timeout(
+                BACKEND_INITIALIZATION_TIMEOUT,
+                Box::pin(PostgresResponseStore::new(
+                    url,
+                    &cfg.responses_table,
+                    &cfg.conversations_table,
+                    cfg.items_table.as_deref(),
+                    &tls,
+                    cfg.pool.as_ref(),
+                    cfg.compression.as_ref(),
+                )),
+            )
             .await
+            .map_err(|_elapsed| permanent(url, "backend initialization timed out after 30 seconds"))?
             .map_err(|e| transient(url, &e.to_string()))
         }
     }
