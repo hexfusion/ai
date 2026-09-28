@@ -4350,11 +4350,6 @@ async fn generated_responses_table_gates_conversations_on_schema_version() {
 // Test Utilities
 // -----------------------------------------------------------------------------
 
-/// Construct the stateless filter for tests that do not exercise a store.
-fn build_test_filter() -> Box<dyn HttpFilter> {
-    Box::new(OpenaiConversationsFilter)
-}
-
 /// A stateless conversations filter plus the shared store its requests resolve.
 ///
 /// The filter holds no store; the store lives in the per-request registry, so a
