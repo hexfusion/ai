@@ -55,9 +55,7 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    super::{
-        DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState,
-    },
+    super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, validate_config},
     list_input_items,
