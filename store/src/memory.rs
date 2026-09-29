@@ -119,6 +119,26 @@ fn reject_duplicate_item_ids(inner: &Inner, items: &[ConversationItemRecord]) ->
     Ok(())
 }
 
+/// Reject a batch that reuses an owner-scoped conversation position, within
+/// itself or against stored rows.
+fn reject_duplicate_item_positions(inner: &Inner, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+    let mut seen = HashSet::with_capacity(items.len());
+    for item in items {
+        let key = (item.owner.clone(), item.conversation_id.clone(), item.position);
+        let stored_collision = inner
+            .items
+            .get(&(item.owner.clone(), item.conversation_id.clone()))
+            .is_some_and(|stored| stored.iter().any(|existing| existing.position == item.position));
+        if !seen.insert(key) || stored_collision {
+            return Err(StoreError::InvalidInput(format!(
+                "conversation position '{}' already exists",
+                item.position
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject items that leave the authorized scope or whose parent is absent.
 ///
 /// Mirrors the SQL `require_matching_item_scope` guard plus the rebuild update
@@ -150,6 +170,13 @@ fn require_conversation_scope(
 
 /// Record approvals insert-if-absent, so a re-emit never resets a consumed row.
 fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, records: &[PendingApprovalRecord]) {
+    if !inner
+        .responses
+        .get(response_id)
+        .is_some_and(|response| &response.owner == owner)
+    {
+        return;
+    }
     for record in records {
         let key = (owner.clone(), response_id.to_owned(), record.approval_id.clone());
         inner.approvals.entry(key).or_insert_with(|| StoredApproval {
@@ -398,6 +425,7 @@ impl ConversationItemStore for InMemoryStore {
             }
         }
         reject_duplicate_item_ids(&inner, items)?;
+        reject_duplicate_item_positions(&inner, items)?;
         for item in items {
             inner.item_ids.insert((item.owner.clone(), item.item_id.clone()));
             inner
@@ -631,9 +659,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "linear all-or-nothing assertions")]
     async fn consume_approvals_is_all_or_nothing() {
         let store = InMemoryStore::new();
         let o = owner("a");
+        store
+            .upsert_response(&ResponseRecord {
+                id: "r1".to_owned(),
+                owner: o.clone(),
+                created_at: 1,
+                model: "m".to_owned(),
+                response_object: serde_json::json!({}),
+                input: serde_json::json!({}),
+                messages: serde_json::json!([]),
+            })
+            .await
+            .unwrap();
         store
             .record_pending_approvals(&o, "r1", &[approval("x"), approval("y")], 10)
             .await

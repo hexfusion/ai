@@ -57,12 +57,14 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     responses_are_owner_scoped(backend).await;
     response_id_is_globally_unique(backend).await;
     approvals_consume_all_or_nothing(backend).await;
+    approvals_require_an_owner_matched_response(backend).await;
     persist_pairs_response_and_approvals(backend).await;
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
+    item_positions_are_owner_scoped_and_atomic(backend).await;
     item_writes_enforce_parent_scope(backend).await;
 }
 
@@ -229,6 +231,60 @@ async fn approvals_consume_all_or_nothing(backend: &dyn PersistedStateBackend) {
             .expect("consume a2"),
         None,
         "outstanding approval must survive an aborted batch"
+    );
+}
+
+/// Approval rows cannot exist without an issuing response owned by the caller.
+#[expect(clippy::too_many_lines, reason = "linear parent and owner contract assertions")]
+async fn approvals_require_an_owner_matched_response(backend: &dyn PersistedStateBackend) {
+    let issuing_owner = owner("approval-parent");
+    let other = owner("approval-parent-other");
+    let pending = approval("orphan-approval");
+
+    backend
+        .record_pending_approvals(&issuing_owner, "missing-response", std::slice::from_ref(&pending), 1)
+        .await
+        .expect("missing response makes the approval insert a no-op");
+    assert!(
+        backend
+            .get_pending_approvals(&issuing_owner, "missing-response", &["orphan-approval"])
+            .await
+            .expect("read missing-response approvals")
+            .is_empty(),
+        "approval persisted without its issuing response"
+    );
+    assert_eq!(
+        backend
+            .consume_approvals(&issuing_owner, "missing-response", &["orphan-approval"], 2)
+            .await
+            .expect("consume missing-response approval"),
+        Some(0),
+        "orphaned approval was consumable"
+    );
+
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "owned-response".to_owned(),
+            owner: issuing_owner,
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert owner-matched response");
+    backend
+        .record_pending_approvals(&other, "owned-response", &[approval("wrong-owner-approval")], 3)
+        .await
+        .expect("wrong owner makes the approval insert a no-op");
+    assert!(
+        backend
+            .get_pending_approvals(&other, "owned-response", &["wrong-owner-approval"])
+            .await
+            .expect("read wrong-owner approvals")
+            .is_empty(),
+        "approval persisted under an owner that does not own its issuing response"
     );
 }
 
@@ -459,6 +515,62 @@ async fn item_ids_are_owner_scoped(backend: &dyn PersistedStateBackend) {
             .expect("get owner b item")
             .is_some(),
         "owner b item missing"
+    );
+}
+
+/// Item positions are unique within an owner's conversation, and a conflicting
+/// batch leaves no partial rows behind.
+#[expect(clippy::too_many_lines, reason = "linear uniqueness and rollback assertions")]
+async fn item_positions_are_owner_scoped_and_atomic(backend: &dyn PersistedStateBackend) {
+    let owner = owner("item-position");
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_position".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert position-test conversation");
+
+    let mut first = item(&owner, "conv_position", "position-first");
+    first.position = 7;
+    let mut second = item(&owner, "conv_position", "position-second");
+    second.position = 7;
+    assert!(
+        backend
+            .create_conversation_items(&[first.clone(), second.clone()])
+            .await
+            .is_err(),
+        "duplicate positions in one batch were accepted"
+    );
+    assert!(
+        backend
+            .list_conversation_items(&owner, "conv_position", None, 10, true)
+            .await
+            .expect("list after rejected position batch")
+            .is_empty(),
+        "a rejected position batch committed partial rows"
+    );
+
+    backend
+        .create_conversation_items(std::slice::from_ref(&first))
+        .await
+        .expect("insert first position");
+    assert!(
+        backend.create_conversation_items(&[second]).await.is_err(),
+        "a position already held by a stored item was accepted"
+    );
+    let stored = backend
+        .list_conversation_items(&owner, "conv_position", None, 10, true)
+        .await
+        .expect("list after stored-position collision");
+    assert_eq!(stored.len(), 1, "stored-position collision changed existing rows");
+    assert_eq!(
+        stored.first().map(|item| item.item_id.as_str()),
+        Some("position-first"),
+        "the original item must remain after the collision"
     );
 }
 
