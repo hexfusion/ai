@@ -30,7 +30,9 @@ pub use backend_config::{
 };
 #[cfg(feature = "compression")]
 pub use compression::{CompressionAlgorithm, StoreCompressionConfig};
-pub use factory::{BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory};
+pub use factory::{
+    BackendError, BackendNamespaceKey, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory,
+};
 pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};

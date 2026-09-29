@@ -350,46 +350,136 @@ fn table_agnostic_effective_key(
     factory.effective_key(&config)
 }
 
-/// Return the first pair of table or generated-index owners that would collide
-/// in the combined backend's shared SQL schema namespace.
+/// Kind of SQL schema object created by a store configuration.
+#[cfg(feature = "openai-conversations")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SqlObjectKind {
+    /// Main response-object table.
+    ResponsesTable,
+    /// Pending tool-approval table associated with a response table.
+    PendingApprovalsTable,
+    /// Schema-version table associated with a response table.
+    SchemaVersionTable,
+    /// Conversation metadata table.
+    ConversationsTable,
+    /// Tenant lookup index associated with a conversations table.
+    ConversationsTenantIndex,
+    /// Conversation-item table.
+    ItemsTable,
+    /// Conversation lookup index associated with an items table.
+    ItemsConversationIndex,
+    /// Position uniqueness index associated with an items table.
+    ItemsPositionIndex,
+}
+
+/// One table or generated index created by a store configuration.
+#[cfg(feature = "openai-conversations")]
+struct SqlObject {
+    /// Schema shape represented by this object.
+    kind: SqlObjectKind,
+    /// Human-readable config or generated-object owner for diagnostics.
+    owner: &'static str,
+    /// SQL namespace name compared case-insensitively.
+    name: String,
+}
+
+/// Inventory the schema objects created by one store configuration.
 #[cfg(feature = "openai-conversations")]
 #[expect(
     clippy::too_many_lines,
-    reason = "the complete shared SQL object-name inventory must remain visible together"
+    reason = "the complete SQL object-name inventory must remain visible together"
 )]
-fn combined_schema_name_collision(response_ref: &StoreRef, items_table: &str) -> Option<(&'static str, &'static str)> {
-    let responses_table = response_ref
-        .config
-        .get("responses_table")
-        .and_then(serde_json::Value::as_str)?;
-    let conversations_table = response_ref
-        .config
-        .get("conversations_table")
-        .and_then(serde_json::Value::as_str)?;
-    let names = [
-        ("responses_table", responses_table.to_owned()),
-        ("conversations_table", conversations_table.to_owned()),
-        ("items_table", items_table.to_owned()),
-        (
-            "responses pending-approvals table",
-            format!("{responses_table}_pending_approvals"),
-        ),
-        (
-            "responses schema-version table",
-            format!("{responses_table}_schema_version"),
-        ),
-        (
-            "conversations tenant index",
-            format!("idx_{conversations_table}_tenant_id"),
-        ),
-        ("items conversation index", format!("idx_{items_table}_conversation")),
-        ("items position index", format!("idx_{items_table}_position")),
+fn sql_objects(config: &serde_json::Value) -> Option<Vec<SqlObject>> {
+    let responses_table = config.get("responses_table")?.as_str()?;
+    let conversations_table = config.get("conversations_table")?.as_str()?;
+    let mut objects = vec![
+        SqlObject {
+            kind: SqlObjectKind::ResponsesTable,
+            owner: "responses_table",
+            name: responses_table.to_owned(),
+        },
+        SqlObject {
+            kind: SqlObjectKind::PendingApprovalsTable,
+            owner: "responses pending-approvals table",
+            name: format!("{responses_table}_pending_approvals"),
+        },
+        SqlObject {
+            kind: SqlObjectKind::SchemaVersionTable,
+            owner: "responses schema-version table",
+            name: format!("{responses_table}_schema_version"),
+        },
+        SqlObject {
+            kind: SqlObjectKind::ConversationsTable,
+            owner: "conversations_table",
+            name: conversations_table.to_owned(),
+        },
+        SqlObject {
+            kind: SqlObjectKind::ConversationsTenantIndex,
+            owner: "conversations tenant index",
+            name: format!("idx_{conversations_table}_tenant_id"),
+        },
     ];
-    let mut seen = HashMap::with_capacity(names.len());
-    names.into_iter().find_map(|(owner, name)| {
-        seen.insert(name.to_ascii_lowercase(), owner)
-            .map(|previous| (previous, owner))
+    if let Some(items_table) = config.get("items_table").and_then(serde_json::Value::as_str) {
+        objects.extend([
+            SqlObject {
+                kind: SqlObjectKind::ItemsTable,
+                owner: "items_table",
+                name: items_table.to_owned(),
+            },
+            SqlObject {
+                kind: SqlObjectKind::ItemsConversationIndex,
+                owner: "items conversation index",
+                name: format!("idx_{items_table}_conversation"),
+            },
+            SqlObject {
+                kind: SqlObjectKind::ItemsPositionIndex,
+                owner: "items position index",
+                name: format!("idx_{items_table}_position"),
+            },
+        ]);
+    }
+    Some(objects)
+}
+
+/// Return the first incompatible object-name collision between two stores.
+///
+/// Equal kinds are compatible duplicate DDL, such as both filters creating the
+/// same conversations table. Reusing the name for a different kind is unsafe.
+#[cfg(feature = "openai-conversations")]
+fn cross_store_schema_name_collision(
+    response_ref: &StoreRef,
+    conversation_ref: &StoreRef,
+) -> Option<(&'static str, &'static str)> {
+    let response_objects = sql_objects(&response_ref.config)?;
+    let conversation_objects = sql_objects(&conversation_ref.config)?;
+    response_objects.iter().find_map(|response| {
+        conversation_objects.iter().find_map(|conversation| {
+            (response.kind != conversation.kind && response.name.eq_ignore_ascii_case(&conversation.name))
+                .then_some((response.owner, conversation.owner))
+        })
     })
+}
+
+/// Return the first incompatible collision within one final schema inventory.
+#[cfg(feature = "openai-conversations")]
+fn schema_name_collision(objects: &[SqlObject]) -> Option<(&'static str, &'static str)> {
+    objects.iter().enumerate().find_map(|(index, first)| {
+        objects.iter().skip(index + 1).find_map(|second| {
+            (first.kind != second.kind && first.name.eq_ignore_ascii_case(&second.name))
+                .then_some((first.owner, second.owner))
+        })
+    })
+}
+
+/// Build an actionable SQL namespace-collision error.
+#[cfg(feature = "openai-conversations")]
+fn namespace_collision_error(store_ref: &StoreRef, first: &str, second: &str) -> ProvisionError {
+    ProvisionError::Backend {
+        name: Arc::clone(&store_ref.name),
+        source: BackendError::Config(format!(
+            "Store configurations target the same SQL namespace, but {first} collides with {second}; configure distinct responses_table, conversations_table, and items_table names"
+        )),
+    }
 }
 
 /// Build the combined table configuration when two filter references share all
@@ -397,16 +487,14 @@ fn combined_schema_name_collision(response_ref: &StoreRef, items_table: &str) ->
 #[cfg(feature = "openai-conversations")]
 #[expect(
     clippy::too_many_lines,
-    reason = "compatibility, factory identity, and combined table validation form one decision"
+    reason = "coalescing validation is clearer as one transactional decision"
 )]
 fn combined_filter_config(
     response_ref: &StoreRef,
     conversation_ref: &StoreRef,
     factories: &HashMap<&str, &dyn StoreBackendFactory>,
 ) -> Result<Option<serde_json::Value>, ProvisionError> {
-    let response_table = response_ref.config.get("conversations_table");
-    let conversation_table = conversation_ref.config.get("conversations_table");
-    if response_ref.backend_id != conversation_ref.backend_id || response_table != conversation_table {
+    if response_ref.backend_id != conversation_ref.backend_id {
         return Ok(None);
     }
     let Some(factory) = factories.get(response_ref.backend_id.as_ref()) else {
@@ -418,29 +506,70 @@ fn combined_filter_config(
             source,
         })
     };
-    if sharing_key(response_ref)? != sharing_key(conversation_ref)? {
-        return Ok(None);
+    let sharing_matches = sharing_key(response_ref)? == sharing_key(conversation_ref)?;
+    let response_table = response_ref.config.get("conversations_table");
+    let conversation_table = conversation_ref.config.get("conversations_table");
+    if sharing_matches && response_table == conversation_table {
+        let Some(items_table) = conversation_ref.config.get("items_table").cloned() else {
+            return Ok(None);
+        };
+        let mut combined = response_ref.config.clone();
+        let Some(object) = combined.as_object_mut() else {
+            return Ok(None);
+        };
+        object.insert("items_table".to_owned(), items_table);
+        if let Some(objects) = sql_objects(&combined)
+            && let Some((first, second)) = schema_name_collision(&objects)
+        {
+            return Err(namespace_collision_error(response_ref, first, second));
+        }
+        return Ok(Some(combined));
     }
-    let Some(items_table) = conversation_ref.config.get("items_table").cloned() else {
-        return Ok(None);
-    };
-    let Some(items_table_name) = items_table.as_str() else {
-        return Ok(None);
-    };
-    if let Some((first, second)) = combined_schema_name_collision(response_ref, items_table_name) {
-        return Err(ProvisionError::Backend {
-            name: Arc::clone(&response_ref.name),
-            source: BackendError::Config(format!(
-                "Responses and Conversations target the same SQL namespace, but {first} collides with {second}; configure distinct responses_table, conversations_table, and items_table names"
-            )),
-        });
+    Ok(None)
+}
+
+/// Validate object-name compatibility across the final promoted store plan.
+#[cfg(feature = "openai-conversations")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "namespace resolution and pairwise object validation form one pass"
+)]
+fn validate_sql_namespace_collisions(
+    plans: &[ListenerStorePlan],
+    factories: &HashMap<&str, &dyn StoreBackendFactory>,
+) -> Result<(), ProvisionError> {
+    let refs: Vec<&StoreRef> = plans.iter().flat_map(|plan| &plan.refs).collect();
+    for (index, first) in refs.iter().enumerate() {
+        let Some(factory) = factories.get(first.backend_id.as_ref()) else {
+            continue;
+        };
+        let first_namespace = factory
+            .namespace_key(&first.config)
+            .map_err(|source| ProvisionError::Backend {
+                name: Arc::clone(&first.name),
+                source,
+            })?;
+        let Some(first_namespace) = first_namespace else {
+            continue;
+        };
+        for second in refs.iter().skip(index + 1) {
+            if first.backend_id != second.backend_id {
+                continue;
+            }
+            let second_namespace = factory
+                .namespace_key(&second.config)
+                .map_err(|source| ProvisionError::Backend {
+                    name: Arc::clone(&second.name),
+                    source,
+                })?;
+            if second_namespace.as_ref() == Some(&first_namespace)
+                && let Some((first_owner, second_owner)) = cross_store_schema_name_collision(first, second)
+            {
+                return Err(namespace_collision_error(first, first_owner, second_owner));
+            }
+        }
     }
-    let mut combined = response_ref.config.clone();
-    let Some(object) = combined.as_object_mut() else {
-        return Ok(None);
-    };
-    object.insert("items_table".to_owned(), items_table);
-    Ok(Some(combined))
+    Ok(())
 }
 
 /// Location of one store reference within the server's listener plans.
@@ -657,6 +786,7 @@ fn validate_and_deduplicate_refs(
         if let (Some(cache), Some(active_plans)) = (cache, active_plans) {
             preserve_active_store_configs(plans, active_plans, &factories, cache, &promoted)?;
         }
+        validate_sql_namespace_collisions(plans, &factories)?;
     }
 
     for plan in plans {
@@ -1671,10 +1801,144 @@ filter_chains:
 
     #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
     #[test]
-    fn file_backed_sqlite_namespace_collisions_are_rejected() {
+    fn coalesced_in_memory_sqlite_namespace_collisions_are_rejected() {
+        let config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
+
+        assert_sql_namespace_collisions_are_rejected(config);
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn coalesced_schema_ignores_discarded_conversations_placeholder_objects() {
+        let mut config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
+        let responses = config
+            .filter_chains
+            .first_mut()
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Responses filter");
+        responses.config.as_mapping_mut().expect("Responses config").insert(
+            serde_yaml::Value::String("responses_table".to_owned()),
+            serde_yaml::Value::String("conversations_unused_responses_pending_approvals".to_owned()),
+        );
+
+        build_store_wiring(&config).expect("discarded placeholder objects cannot collide with the combined schema");
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn final_plan_validation_ignores_promoted_placeholder_objects() {
         let directory = tempfile::tempdir().expect("temporary SQLite directory");
         let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
-        let config = responses_and_conversations_config_for("sqlite", &database_url);
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: combined
+    address: "127.0.0.1:8080"
+    filter_chains: [responses, conversations]
+  - name: other
+    address: "127.0.0.1:8081"
+    filter_chains: [other-responses]
+filter_chains:
+  - name: responses
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: responses
+        conversations_table: conversations
+  - name: conversations
+    filters:
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "{database_url}"
+        conversations_table: conversations
+        items_table: items
+  - name: other-responses
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "{database_url}"
+        responses_table: conversations_unused_responses_pending_approvals
+        conversations_table: other_conversations
+"#,
+        ))
+        .expect("combined and independent Responses config");
+
+        build_store_wiring(&config).expect("only objects in the final promoted plan participate in collision checks");
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn independent_private_memory_sqlite_stores_allow_reused_names() {
+        for database_url in [
+            "sqlite://file::memory:",
+            "sqlite://%3Amemory%3A",
+            "sqlite://private?mode=memory&cache=private",
+        ] {
+            let mut config = responses_and_conversations_config_for("sqlite", database_url);
+            let conversations = config
+                .filter_chains
+                .get_mut(1)
+                .and_then(|chain| chain.filters.first_mut())
+                .expect("Conversations filter");
+            let mapping = conversations.config.as_mapping_mut().expect("Conversations config");
+            mapping.insert(
+                serde_yaml::Value::String("items_table".to_owned()),
+                serde_yaml::Value::String("responses".to_owned()),
+            );
+            mapping.insert(
+                serde_yaml::Value::String("pool".to_owned()),
+                serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
+            );
+
+            build_store_wiring(&config).expect("independent private databases may reuse object names");
+        }
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn file_backed_sqlite_namespace_collisions_with_mismatched_pool_are_rejected() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let mut config = responses_and_conversations_config_for("sqlite", &database_url);
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        conversations
+            .config
+            .as_mapping_mut()
+            .expect("Conversations config")
+            .extend([
+                (
+                    serde_yaml::Value::String("conversations_table".to_owned()),
+                    serde_yaml::Value::String("other_conversations".to_owned()),
+                ),
+                (
+                    serde_yaml::Value::String("pool".to_owned()),
+                    serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
+                ),
+            ]);
+
+        assert_sql_namespace_collisions_are_rejected(config);
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn file_backed_sqlite_namespace_collisions_with_mismatched_compression_are_rejected() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
+        let mut config = responses_and_conversations_config_for("sqlite", &database_url);
+        let responses = config
+            .filter_chains
+            .first_mut()
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Responses filter");
+        responses.config.as_mapping_mut().expect("Responses config").insert(
+            serde_yaml::Value::String("compression".to_owned()),
+            serde_yaml::to_value(json!({"algorithm": "zstd"})).expect("compression config"),
+        );
 
         assert_sql_namespace_collisions_are_rejected(config);
     }

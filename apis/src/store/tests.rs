@@ -2892,8 +2892,8 @@ async fn sqlite_rejects_schema_version_mismatch() {
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
     assert!(
-        msg.contains("migration required"),
-        "error should mention migration: {msg}"
+        msg.contains("recreation required"),
+        "error should mention recreation: {msg}"
     );
 }
 

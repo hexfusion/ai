@@ -39,6 +39,29 @@ impl fmt::Debug for EffectiveConfigKey {
     }
 }
 
+/// Canonical identity of the physical namespace a backend mutates.
+///
+/// Unlike [`EffectiveConfigKey`], this deliberately excludes pool, TLS,
+/// compression, and table settings. Two references with equal namespace keys
+/// may open different pools, but their schema objects can still collide.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct BackendNamespaceKey(Arc<str>);
+
+impl BackendNamespaceKey {
+    /// Wrap a factory-computed physical namespace key.
+    #[must_use]
+    pub fn new(key: impl Into<Arc<str>>) -> Self {
+        Self(key.into())
+    }
+}
+
+impl fmt::Debug for BackendNamespaceKey {
+    /// Never print a namespace key because it may contain connection details.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BackendNamespaceKey(..)")
+    }
+}
+
 /// Why a backend could not be provisioned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendError {
@@ -101,6 +124,19 @@ pub trait StoreBackendFactory: Send + Sync {
     ///
     /// Returns [`BackendError::Config`] when the configuration is malformed.
     fn effective_key(&self, config: &serde_json::Value) -> Result<EffectiveConfigKey, BackendError>;
+
+    /// Compute the physical namespace a backend configuration mutates.
+    ///
+    /// SQL factories use this identity to detect schema-object collisions even
+    /// when pool, TLS, compression, or table settings require separate backend
+    /// instances. Non-SQL factories may return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Config`] when the configuration is malformed.
+    fn namespace_key(&self, _config: &serde_json::Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+        Ok(None)
+    }
 
     /// Validate configuration without I/O, so a malformed config fails at
     /// pipeline construction rather than at first traffic. The default checks

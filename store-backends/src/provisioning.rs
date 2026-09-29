@@ -78,15 +78,18 @@ fn compression_fingerprint(compression: Option<&praxis_ai_store::StoreCompressio
 /// SQLite-backed store-backend factory.
 #[cfg(feature = "sqlite")]
 mod sqlite {
-    use std::sync::Arc;
+    use std::{str::FromStr as _, sync::Arc};
 
     use async_trait::async_trait;
+    use percent_encoding::percent_decode_str;
     use praxis_ai_store::{
-        EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, StoreBackendFactory, StoreCompressionConfig,
+        BackendNamespaceKey, EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, StoreBackendFactory,
+        StoreCompressionConfig,
     };
     use secrecy::{ExposeSecret as _, SecretString};
     use serde::Deserialize;
     use serde_json::Value;
+    use sqlx::sqlite::SqliteConnectOptions;
 
     use super::{BACKEND_INITIALIZATION_TIMEOUT, BackendError, permanent};
     use crate::SqliteResponseStore;
@@ -159,6 +162,61 @@ mod sqlite {
             Ok(EffectiveConfigKey::new(key))
         }
 
+        #[expect(
+            clippy::too_many_lines,
+            reason = "SQLite URI mode, cache, and filename semantics form one namespace decision"
+        )]
+        fn namespace_key(&self, config: &Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            let cfg = Self::parse(config)?;
+            let url = cfg.database_url.expose_secret();
+            let sqlite_url = url
+                .trim()
+                .strip_prefix("sqlite://")
+                .or_else(|| url.trim().strip_prefix("sqlite:"))
+                .unwrap_or_else(|| url.trim());
+            let (database, query) = sqlite_url.split_once('?').unwrap_or((sqlite_url, ""));
+            let database = percent_decode_str(database).decode_utf8_lossy();
+            let mut memory_mode = false;
+            let mut shared_cache = false;
+            let mut memory_vfs = false;
+            for parameter in query.split('&') {
+                let parameter = percent_decode_str(parameter).decode_utf8_lossy();
+                if parameter.eq_ignore_ascii_case("mode=memory") {
+                    memory_mode = true;
+                    shared_cache = true;
+                } else if parameter.eq_ignore_ascii_case("cache=private") {
+                    shared_cache = false;
+                } else if parameter.eq_ignore_ascii_case("cache=shared") {
+                    shared_cache = true;
+                } else if parameter.eq_ignore_ascii_case("vfs=memdb") {
+                    memory_vfs = true;
+                }
+            }
+            let private_memory = database.is_empty()
+                || database == ":memory:"
+                || (database == "file::memory:" && !shared_cache)
+                || (memory_mode && !shared_cache)
+                || memory_vfs;
+            if private_memory {
+                return Ok(None);
+            }
+            let options = SqliteConnectOptions::from_str(url)
+                .map_err(|error| BackendError::Config(format!("invalid SQLite database URL: {error}")))?;
+            let (namespace_kind, path) = if memory_mode {
+                ("sqlite-memory-mode", options.get_filename().to_path_buf())
+            } else if database == "file::memory:" {
+                ("sqlite-memory-uri", options.get_filename().to_path_buf())
+            } else {
+                let path = std::path::absolute(options.get_filename())
+                    .map_err(|error| BackendError::Config(format!("cannot resolve SQLite database path: {error}")))?;
+                ("sqlite-file", path)
+            };
+            Ok(Some(BackendNamespaceKey::new(format!(
+                "{namespace_kind}\u{1f}{}",
+                path.display()
+            ))))
+        }
+
         async fn build(&self, config: &Value) -> Result<ProvisionedBackend, BackendError> {
             let cfg = Self::parse(config)?;
             let url = cfg.database_url.expose_secret();
@@ -192,16 +250,17 @@ mod sqlite {
 /// Postgres-backed store-backend factory.
 #[cfg(feature = "postgres")]
 mod postgres {
-    use std::sync::Arc;
+    use std::{str::FromStr as _, sync::Arc};
 
     use async_trait::async_trait;
     use praxis_ai_store::{
-        EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, SslMode, StoreBackendFactory,
-        StoreCompressionConfig,
+        BackendNamespaceKey, EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, SslMode,
+        StoreBackendFactory, StoreCompressionConfig,
     };
     use secrecy::{ExposeSecret as _, SecretString};
     use serde::Deserialize;
     use serde_json::Value;
+    use sqlx::postgres::PgConnectOptions;
 
     use super::{BACKEND_INITIALIZATION_TIMEOUT, BackendError, permanent, transient};
     use crate::{PgTlsConfig, PostgresResponseStore, postgres_url};
@@ -352,6 +411,22 @@ mod postgres {
             Ok(EffectiveConfigKey::new(key))
         }
 
+        fn namespace_key(&self, config: &Value) -> Result<Option<BackendNamespaceKey>, BackendError> {
+            let cfg = Self::parse(config)?;
+            let options = PgConnectOptions::from_str(cfg.database_url.expose_secret())
+                .map_err(|error| BackendError::Config(format!("invalid PostgreSQL database URL: {error}")))?;
+            let database = options.get_database().unwrap_or_else(|| options.get_username());
+            let endpoint = options
+                .get_socket()
+                .map_or_else(|| options.get_host().to_owned(), |socket| socket.display().to_string());
+            Ok(Some(BackendNamespaceKey::new(format!(
+                "postgres\u{1f}{endpoint}\u{1f}{}\u{1f}{database}\u{1f}{}\u{1f}{}",
+                options.get_port(),
+                options.get_username(),
+                options.get_options().unwrap_or_default()
+            ))))
+        }
+
         fn validate_config(&self, config: &Value) -> Result<(), BackendError> {
             let cfg = Self::parse(config)?;
             let url = cfg.database_url.expose_secret();
@@ -489,6 +564,142 @@ mod tests {
         assert_eq!(implicit_zstd, explicit_zstd);
     }
 
+    #[test]
+    fn sqlite_namespace_key_ignores_pool_and_compression() {
+        let base = json!({
+            "database_url": "sqlite:///tmp/praxis-namespace.db?mode=rwc",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let factory = SqliteBackendFactory;
+        let expected = factory.namespace_key(&base).expect("base namespace key");
+        let different_runtime_settings = with_field(
+            with_field(base, "pool", json!({"max_connections": 3})),
+            "compression",
+            json!({"algorithm": "zstd", "level": 5}),
+        );
+
+        assert_eq!(
+            factory
+                .namespace_key(&different_runtime_settings)
+                .expect("namespace key with runtime overrides"),
+            expected
+        );
+    }
+
+    #[test]
+    fn sqlite_private_memory_urls_have_no_namespace_key() {
+        let factory = SqliteBackendFactory;
+        for database_url in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            "sqlite://file::memory:",
+            "sqlite://%3Amemory%3A",
+            "sqlite://?mode=memory",
+            "sqlite://",
+            "sqlite://?mode=rwc",
+            "sqlite://private?mode=memory&cache=private",
+            "sqlite://private?vfs=memdb",
+        ] {
+            let config = json!({
+                "database_url": database_url,
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+            });
+            assert_eq!(
+                factory.namespace_key(&config).expect("private memory namespace"),
+                None,
+                "{database_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_named_shared_memory_has_stable_namespace_key() {
+        let factory = SqliteBackendFactory;
+        for database_url in ["sqlite://shared?mode=memory", "sqlite://file::memory:?cache=shared"] {
+            let config = json!({
+                "database_url": database_url,
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+            });
+
+            let first = factory.namespace_key(&config).expect("first named memory namespace");
+            let second = factory.namespace_key(&config).expect("second named memory namespace");
+            assert!(first.is_some(), "{database_url}");
+            assert_eq!(first, second, "{database_url}");
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three namespace boundary assertions belong in one regression test"
+    )]
+    fn sqlite_named_memory_is_distinct_from_disk_at_same_path() {
+        let factory = SqliteBackendFactory;
+        let config = |database_url| {
+            json!({
+                "database_url": database_url,
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+            })
+        };
+
+        assert_ne!(
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?mode=memory"))
+                .expect("memory namespace"),
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?mode=rwc"))
+                .expect("file namespace"),
+        );
+        assert_ne!(
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?vfs=memdb"))
+                .expect("memdb namespace"),
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?mode=rwc"))
+                .expect("file namespace"),
+        );
+        assert_ne!(
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?vfs=memdb"))
+                .expect("memdb namespace"),
+            factory
+                .namespace_key(&config("sqlite:///tmp/praxis-namespace.db?mode=memory"))
+                .expect("shared-cache memory namespace"),
+        );
+    }
+
+    #[test]
+    fn sqlite_named_memory_preserves_exact_uri_name() {
+        let factory = SqliteBackendFactory;
+        let config = |database_url| {
+            json!({
+                "database_url": database_url,
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+            })
+        };
+        let absolute = format!(
+            "sqlite://{}?mode=memory",
+            std::env::current_dir()
+                .expect("current directory")
+                .join("praxis-named-memory")
+                .display()
+        );
+
+        assert_ne!(
+            factory
+                .namespace_key(&config("sqlite://praxis-named-memory?mode=memory"))
+                .expect("relative named memory namespace"),
+            factory
+                .namespace_key(&config(&absolute))
+                .expect("absolute named memory namespace"),
+        );
+    }
+
     #[cfg(feature = "postgres")]
     #[test]
     fn postgres_effective_key_canonicalizes_default_ssl_mode() {
@@ -504,6 +715,87 @@ mod tests {
             .expect("explicit TLS key");
 
         assert_eq!(implicit, explicit);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_namespace_key_ignores_credentials_tls_pool_and_compression() {
+        let base = json!({
+            "database_url": "postgresql://user:secret@db.example.com/store",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let factory = PostgresBackendFactory;
+        let expected = factory.namespace_key(&base).expect("base namespace key");
+        let different_runtime_settings = with_field(
+            with_field(
+                with_field(
+                    with_field(
+                        base,
+                        "database_url",
+                        json!("postgresql://user:other@db.example.com/store"),
+                    ),
+                    "ssl_mode",
+                    json!("require"),
+                ),
+                "pool",
+                json!({"max_connections": 3}),
+            ),
+            "compression",
+            json!({"algorithm": "zstd", "level": 5}),
+        );
+
+        assert_eq!(
+            factory
+                .namespace_key(&different_runtime_settings)
+                .expect("namespace key with runtime overrides"),
+            expected
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_namespace_key_distinguishes_roles() {
+        let base = json!({
+            "database_url": "postgresql://first@db.example.com/store",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+        let factory = PostgresBackendFactory;
+        let expected = factory.namespace_key(&base).expect("base namespace key");
+        assert_ne!(
+            factory
+                .namespace_key(&with_field(
+                    base,
+                    "database_url",
+                    json!("postgresql://second@db.example.com/store"),
+                ))
+                .expect("second-role namespace key"),
+            expected,
+            "role-dependent default search paths are distinct namespaces"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_namespace_key_distinguishes_socket_ports() {
+        let factory = PostgresBackendFactory;
+        let socket_config = |port| {
+            json!({
+                "database_url": format!("postgresql:///store?host=/tmp&port={port}"),
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+            })
+        };
+        assert_ne!(
+            factory
+                .namespace_key(&socket_config(5432))
+                .expect("first socket namespace key"),
+            factory
+                .namespace_key(&socket_config(5433))
+                .expect("second socket namespace key"),
+            "PostgreSQL socket filenames include the server port"
+        );
     }
 
     #[tokio::test]

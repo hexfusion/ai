@@ -473,7 +473,7 @@ async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<
         Some(v) if v == SCHEMA_VERSION => Ok(()),
         Some(v) => Err(StoreError::Database(format!(
             "schema version mismatch in '{vt}': stored version {v}, \
-             expected {SCHEMA_VERSION}; database migration required"
+             expected {SCHEMA_VERSION}; database recreation required"
         ))),
     }
 }

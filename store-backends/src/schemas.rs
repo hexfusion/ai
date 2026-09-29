@@ -37,8 +37,8 @@ pub(crate) struct TableNames {
 /// 3 stores the responses table's JSON payload columns
 /// (`response_object`, `input`, `messages`) as native binary (`BLOB`
 /// on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so the
-/// response store can persist compressed payloads. Version 2 databases
-/// must be migrated before use.
+/// response store can persist compressed payloads. Older databases are not
+/// migrated in place and must be replaced with an empty schema-v4 store.
 pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 /// Suffix appended to the responses table name to derive the schema
@@ -733,14 +733,14 @@ fn same_column_set(expected: &[&str], actual: &[String]) -> bool {
 /// Collapse accumulated schema-validation errors into a single [`Result`].
 ///
 /// An empty list is success; otherwise every offending item is joined into one
-/// [`StoreError::Database`] with the shared "migration required" envelope so
+/// [`StoreError::Database`] with the shared "recreation required" envelope so
 /// callers surface all problems at once.
 fn into_validation_result(errors: &[String]) -> Result<(), StoreError> {
     if errors.is_empty() {
         Ok(())
     } else {
         Err(StoreError::Database(format!(
-            "schema validation failed: {}; database migration required",
+            "schema validation failed: {}; database recreation required",
             errors.join("; ")
         )))
     }
@@ -1299,7 +1299,7 @@ mod tests {
             } else {
                 let msg = result.unwrap_err().to_string();
                 assert!(msg.contains("schema validation failed"), "case '{name}': {msg}");
-                assert!(msg.contains("database migration required"), "case '{name}': {msg}");
+                assert!(msg.contains("database recreation required"), "case '{name}': {msg}");
                 for needle in *expect_errors {
                     assert!(msg.contains(needle), "case '{name}': expected {needle:?} in {msg}");
                 }
