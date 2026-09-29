@@ -546,10 +546,6 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
 }
 
 #[async_trait]
-#[expect(
-    clippy::too_many_lines,
-    reason = "owner-scoped SQL methods keep all bindings explicit"
-)]
 impl ResponseStore for PostgresResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
         let [response_object, input, messages] = self.compression.encode(record).await?;
