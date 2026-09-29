@@ -2686,8 +2686,8 @@ async fn sqlite_rejects_table_with_incompatible_primary_key() {
         "error should mention the expected id key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2738,8 +2738,8 @@ async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2782,7 +2782,7 @@ async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -2827,7 +2827,7 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
         msg.to_ascii_lowercase().contains("affinity"),
         "error should explain the affinity is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -3484,8 +3484,8 @@ async fn pg_rejects_table_with_incompatible_primary_key() {
         "error should mention the primary key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3519,8 +3519,8 @@ async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3553,7 +3553,7 @@ async fn pg_rejects_table_with_deferrable_primary_key() {
         msg.to_ascii_lowercase().contains("deferrable"),
         "error should explain the constraint is deferrable: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3587,7 +3587,7 @@ async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation folds comparisons: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3619,7 +3619,7 @@ async fn pg_rejects_table_with_citext_key() {
         msg.to_ascii_lowercase().contains("citext"),
         "error should name the case-insensitive type: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
