@@ -49,6 +49,10 @@ fn approval(id: &str) -> PendingApprovalRecord {
 /// # Panics
 ///
 /// Panics if the backend violates the persistence contract.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "sequentially runs the complete backend contract"
+)]
 pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     responses_are_owner_scoped(backend).await;
     response_id_is_globally_unique(backend).await;
@@ -57,6 +61,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
+    item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_writes_enforce_parent_scope(backend).await;
 }
@@ -367,6 +372,53 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         remaining.messages.as_array().map(Vec::len),
         Some(1),
         "message cache rebuilt after delete"
+    );
+}
+
+/// Deleting an item and rebuilding its message cache is atomic when the parent
+/// conversation has already been deleted.
+#[expect(clippy::too_many_lines, reason = "linear rollback contract assertions")]
+async fn item_sync_delete_rolls_back_without_parent(backend: &dyn PersistedStateBackend) {
+    let o = owner("orphan-sync");
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_orphan_sync".to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert conversation");
+    backend
+        .create_items_and_sync_messages(
+            &o,
+            "conv_orphan_sync",
+            &[item(&o, "conv_orphan_sync", "orphan_sync_item")],
+        )
+        .await
+        .expect("create item");
+    assert!(
+        ConversationItemStore::delete_conversation(backend, &o, "conv_orphan_sync")
+            .await
+            .expect("delete parent conversation"),
+        "parent conversation must exist before deletion"
+    );
+
+    assert!(
+        backend
+            .delete_item_and_sync_messages(&o, "conv_orphan_sync", "orphan_sync_item")
+            .await
+            .is_err(),
+        "item delete must fail when its cache parent is absent"
+    );
+    assert!(
+        backend
+            .get_conversation_item(&o, "conv_orphan_sync", "orphan_sync_item")
+            .await
+            .expect("read item after rolled-back delete")
+            .is_some(),
+        "failed cache synchronization must preserve the item"
     );
 }
 

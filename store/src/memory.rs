@@ -552,12 +552,22 @@ impl ConversationItemStore for InMemoryStore {
     ) -> Result<bool, StoreError> {
         let mut inner = self.lock()?;
         let key = (owner.clone(), conversation_id.to_owned());
-        let Some(items) = inner.items.get_mut(&key) else {
+        let Some(index) = inner
+            .items
+            .get(&key)
+            .and_then(|items| items.iter().position(|item| item.item_id == item_id))
+        else {
             return Ok(false);
         };
-        let Some(index) = items.iter().position(|item| item.item_id == item_id) else {
-            return Ok(false);
-        };
+        if !inner.conversations.contains_key(&key) {
+            return Err(StoreError::Database(format!(
+                "conversation disappeared during message sync: {conversation_id}"
+            )));
+        }
+        let items = inner
+            .items
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::Database("conversation items disappeared during message sync".to_owned()))?;
         items.remove(index);
         inner.item_ids.remove(&(owner.clone(), item_id.to_owned()));
         let rebuilt = rebuild_messages(inner.items.get(&key).map_or(&[][..], |items| items.as_slice()));

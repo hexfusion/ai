@@ -1229,6 +1229,8 @@ mod tests {
     use praxis_ai_store::{
         BackendError, EffectiveConfigKey, ProvisionedBackend, RetireBackend, StoreBackendFactory, memory::InMemoryStore,
     };
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    use praxis_ai_store::{ConversationRecord, StateOwner};
     use praxis_filter::FilterRegistry;
     use serde_json::json;
 
@@ -1696,6 +1698,69 @@ filter_chains:
         assert_eq!(retires.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[tokio::test]
+    async fn in_memory_sqlite_ignores_pool_overrides_when_sharing_state() {
+        let mut config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        conversations
+            .config
+            .as_mapping_mut()
+            .expect("Conversations config")
+            .insert(
+                serde_yaml::Value::String("pool".to_owned()),
+                serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
+            );
+
+        let (_registries, provisioner, _reload, _readiness) =
+            build_store_wiring(&config).expect("ignored in-memory pool settings must coalesce");
+        let plan = provisioner.plans.first().expect("combined listener plan");
+        assert_eq!(plan.refs.len(), 2);
+        assert_eq!(
+            plan.refs.first().map(|store_ref| &store_ref.config),
+            plan.refs.get(1).map(|store_ref| &store_ref.config),
+            "both filter names must resolve to one combined backend"
+        );
+
+        let lease = provisioner
+            .cache
+            .provision_into(&plan.refs, &plan.registry)
+            .await
+            .expect("combined in-memory backend");
+        let owner = StateOwner::from_trusted_parts("tenant", "issuer", "subject").expect("owner");
+        let conversations_store = plan
+            .registry
+            .get_scoped(CONVERSATIONS_STORE_NAME, &owner)
+            .expect("Conversations store");
+        conversations_store
+            .upsert_conversation(&ConversationRecord {
+                conversation_id: "conv_shared".to_owned(),
+                owner: owner.clone(),
+                created_at: 1,
+                metadata: json!({}),
+                messages: json!([]),
+            })
+            .await
+            .expect("create conversation");
+        let responses_store = plan
+            .registry
+            .get_scoped(DEFAULT_STORE_NAME, &owner)
+            .expect("Responses store");
+        assert!(
+            responses_store
+                .get_conversation("conv_shared")
+                .await
+                .expect("read conversation through Responses")
+                .is_some(),
+            "Responses must observe Conversations state"
+        );
+        lease.release().await;
+    }
+
     #[cfg(feature = "openai-conversations")]
     #[test]
     fn ambiguous_table_sets_preserve_shared_conversations_identity() {
@@ -1869,7 +1934,7 @@ filter_chains:
 
     #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
     #[test]
-    fn independent_private_memory_sqlite_stores_allow_reused_names() {
+    fn private_memory_sqlite_pool_overrides_do_not_hide_internal_collisions() {
         for database_url in [
             "sqlite://file::memory:",
             "sqlite://%3Amemory%3A",
@@ -1881,17 +1946,16 @@ filter_chains:
                 .get_mut(1)
                 .and_then(|chain| chain.filters.first_mut())
                 .expect("Conversations filter");
-            let mapping = conversations.config.as_mapping_mut().expect("Conversations config");
-            mapping.insert(
-                serde_yaml::Value::String("items_table".to_owned()),
-                serde_yaml::Value::String("responses".to_owned()),
-            );
-            mapping.insert(
-                serde_yaml::Value::String("pool".to_owned()),
-                serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
-            );
+            conversations
+                .config
+                .as_mapping_mut()
+                .expect("Conversations config")
+                .insert(
+                    serde_yaml::Value::String("pool".to_owned()),
+                    serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
+                );
 
-            build_store_wiring(&config).expect("independent private databases may reuse object names");
+            assert_sql_namespace_collisions_are_rejected(config);
         }
     }
 
@@ -1926,6 +1990,29 @@ filter_chains:
 
     #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
     #[test]
+    fn absolute_memdb_namespace_collisions_with_mismatched_pool_are_rejected() {
+        let directory = tempfile::tempdir().expect("temporary SQLite directory");
+        let database_url = format!("sqlite://{}?vfs=memdb", directory.path().join("shared").display());
+        let mut config = responses_and_conversations_config_for("sqlite", &database_url);
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        conversations
+            .config
+            .as_mapping_mut()
+            .expect("Conversations config")
+            .insert(
+                serde_yaml::Value::String("pool".to_owned()),
+                serde_yaml::to_value(json!({"max_connections": 5})).expect("pool config"),
+            );
+
+        assert_sql_namespace_collisions_are_rejected(config);
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
     fn file_backed_sqlite_namespace_collisions_with_mismatched_compression_are_rejected() {
         let directory = tempfile::tempdir().expect("temporary SQLite directory");
         let database_url = format!("sqlite://{}?mode=rwc", directory.path().join("shared.db").display());
@@ -1947,6 +2034,28 @@ filter_chains:
     #[test]
     fn postgres_namespace_collisions_are_rejected() {
         let config = responses_and_conversations_config_for("postgres", "postgresql://user:password@8.8.8.8/store");
+
+        assert_sql_namespace_collisions_are_rejected(config);
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-postgres"))]
+    #[test]
+    fn postgres_namespace_collisions_across_roles_are_rejected() {
+        let mut config =
+            responses_and_conversations_config_for("postgres", "postgresql://first:password@8.8.8.8/store");
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        conversations
+            .config
+            .as_mapping_mut()
+            .expect("Conversations config")
+            .insert(
+                serde_yaml::Value::String("database_url".to_owned()),
+                serde_yaml::Value::String("postgresql://second:password@8.8.8.8/store".to_owned()),
+            );
 
         assert_sql_namespace_collisions_are_rejected(config);
     }

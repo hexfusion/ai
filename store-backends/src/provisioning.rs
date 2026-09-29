@@ -92,7 +92,7 @@ mod sqlite {
     use sqlx::sqlite::SqliteConnectOptions;
 
     use super::{BACKEND_INITIALIZATION_TIMEOUT, BackendError, permanent};
-    use crate::SqliteResponseStore;
+    use crate::{SqliteResponseStore, sqlite::is_memory_database_url};
 
     /// Backend id the SQLite factory answers to.
     pub(crate) const BACKEND_ID: &str = "sqlite";
@@ -149,14 +149,20 @@ mod sqlite {
 
         fn effective_key(&self, config: &Value) -> Result<EffectiveConfigKey, BackendError> {
             let cfg = Self::parse(config)?;
+            let url = cfg.database_url.expose_secret();
+            let pool = if is_memory_database_url(url) {
+                "in-memory-single-connection".to_owned()
+            } else {
+                super::pool_fingerprint(cfg.pool.as_ref())
+            };
             // The pool + url + table names identify one SQLite store instance.
             let key = format!(
                 "sqlite\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                cfg.database_url.expose_secret(),
+                url,
                 cfg.responses_table,
                 cfg.conversations_table,
                 cfg.items_table.as_deref().unwrap_or(""),
-                super::pool_fingerprint(cfg.pool.as_ref()),
+                pool,
                 super::compression_fingerprint(cfg.compression.as_ref()),
             );
             Ok(EffectiveConfigKey::new(key))
@@ -192,17 +198,20 @@ mod sqlite {
                     memory_vfs = true;
                 }
             }
+            let absolute_memdb = memory_vfs && std::path::Path::new(database.as_ref()).is_absolute();
             let private_memory = database.is_empty()
                 || database == ":memory:"
                 || (database == "file::memory:" && !shared_cache)
                 || (memory_mode && !shared_cache)
-                || memory_vfs;
+                || (memory_vfs && !absolute_memdb);
             if private_memory {
                 return Ok(None);
             }
             let options = SqliteConnectOptions::from_str(url)
                 .map_err(|error| BackendError::Config(format!("invalid SQLite database URL: {error}")))?;
-            let (namespace_kind, path) = if memory_mode {
+            let (namespace_kind, path) = if memory_vfs {
+                ("sqlite-memdb", options.get_filename().to_path_buf())
+            } else if memory_mode {
                 ("sqlite-memory-mode", options.get_filename().to_path_buf())
             } else if database == "file::memory:" {
                 ("sqlite-memory-uri", options.get_filename().to_path_buf())
@@ -255,7 +264,7 @@ mod postgres {
     use async_trait::async_trait;
     use praxis_ai_store::{
         BackendNamespaceKey, EffectiveConfigKey, PoolConfig, ProvisionedBackend, RetireBackend, SslMode,
-        StoreBackendFactory, StoreCompressionConfig,
+        StoreBackendFactory, StoreCompressionConfig, StoreError,
     };
     use secrecy::{ExposeSecret as _, SecretString};
     use serde::Deserialize;
@@ -380,7 +389,22 @@ mod postgres {
             )
             .await
             .map_err(|_elapsed| permanent(url, "backend initialization timed out after 30 seconds"))?
-            .map_err(|e| transient(url, &e.to_string()))
+            .map_err(|error| classify_initialization_error(url, &error))
+        }
+    }
+
+    /// Preserve terminal schema diagnostics instead of retrying them as
+    /// connectivity failures.
+    pub(super) fn classify_initialization_error(url: &str, error: &StoreError) -> BackendError {
+        let message = error.to_string();
+        if matches!(
+            error,
+            StoreError::InvalidInput(_) | StoreError::Serialization(_) | StoreError::Unavailable(_)
+        ) || message.contains("database recreation required")
+        {
+            permanent(url, &message)
+        } else {
+            transient(url, &message)
         }
     }
 
@@ -420,9 +444,8 @@ mod postgres {
                 .get_socket()
                 .map_or_else(|| options.get_host().to_owned(), |socket| socket.display().to_string());
             Ok(Some(BackendNamespaceKey::new(format!(
-                "postgres\u{1f}{endpoint}\u{1f}{}\u{1f}{database}\u{1f}{}\u{1f}{}",
+                "postgres\u{1f}{endpoint}\u{1f}{}\u{1f}{database}\u{1f}{}",
                 options.get_port(),
-                options.get_username(),
                 options.get_options().unwrap_or_default()
             ))))
         }
@@ -565,6 +588,41 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_effective_key_ignores_pool_for_memory_databases() {
+        let factory = SqliteBackendFactory;
+        for database_url in ["sqlite::memory:", "sqlite:///tmp/praxis-shared?mode=memory"] {
+            let config = |max_connections| {
+                json!({
+                    "database_url": database_url,
+                    "responses_table": "responses",
+                    "conversations_table": "conversations",
+                    "pool": { "max_connections": max_connections },
+                })
+            };
+
+            assert_eq!(
+                factory.effective_key(&config(1)).expect("first pool key"),
+                factory.effective_key(&config(8)).expect("second pool key"),
+                "in-memory SQLite always uses one connection: {database_url}"
+            );
+        }
+
+        let file_config = |max_connections| {
+            json!({
+                "database_url": "sqlite:///tmp/praxis-file.db?mode=rwc",
+                "responses_table": "responses",
+                "conversations_table": "conversations",
+                "pool": { "max_connections": max_connections },
+            })
+        };
+        assert_ne!(
+            factory.effective_key(&file_config(1)).expect("first file pool key"),
+            factory.effective_key(&file_config(8)).expect("second file pool key"),
+            "file-backed pool settings remain part of backend identity"
+        );
+    }
+
+    #[test]
     fn sqlite_namespace_key_ignores_pool_and_compression() {
         let base = json!({
             "database_url": "sqlite:///tmp/praxis-namespace.db?mode=rwc",
@@ -629,6 +687,21 @@ mod tests {
             assert!(first.is_some(), "{database_url}");
             assert_eq!(first, second, "{database_url}");
         }
+    }
+
+    #[test]
+    fn sqlite_absolute_memdb_has_stable_namespace_key() {
+        let factory = SqliteBackendFactory;
+        let config = json!({
+            "database_url": "sqlite:///tmp/praxis-absolute-memdb?vfs=memdb",
+            "responses_table": "responses",
+            "conversations_table": "conversations",
+        });
+
+        let first = factory.namespace_key(&config).expect("first memdb namespace");
+        let second = factory.namespace_key(&config).expect("second memdb namespace");
+        assert!(first.is_some(), "absolute memdb names are shared across connections");
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -755,7 +828,7 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    fn postgres_namespace_key_distinguishes_roles() {
+    fn postgres_namespace_key_conservatively_ignores_roles() {
         let base = json!({
             "database_url": "postgresql://first@db.example.com/store",
             "responses_table": "responses",
@@ -763,7 +836,7 @@ mod tests {
         });
         let factory = PostgresBackendFactory;
         let expected = factory.namespace_key(&base).expect("base namespace key");
-        assert_ne!(
+        assert_eq!(
             factory
                 .namespace_key(&with_field(
                     base,
@@ -772,7 +845,7 @@ mod tests {
                 ))
                 .expect("second-role namespace key"),
             expected,
-            "role-dependent default search paths are distinct namespaces"
+            "credentials cannot hide collisions in the same explicit database"
         );
     }
 
@@ -904,10 +977,28 @@ mod tests {
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "tests")]
 mod postgres_tests {
-    use praxis_ai_store::StoreBackendFactory as _;
+    use praxis_ai_store::{BackendError, StoreBackendFactory as _, StoreError};
     use serde_json::json;
 
-    use super::postgres::PostgresBackendFactory;
+    use super::postgres::{PostgresBackendFactory, classify_initialization_error};
+
+    #[test]
+    fn schema_initialization_errors_are_terminal() {
+        let schema_error = StoreError::Database(
+            "schema validation failed: incompatible table; database recreation required".to_owned(),
+        );
+        assert!(matches!(
+            classify_initialization_error("postgresql://user:secret@example.com/store", &schema_error),
+            BackendError::Unavailable(message)
+                if message.contains("database recreation required") && !message.contains("secret")
+        ));
+
+        let connection_error = StoreError::Database("connection refused".to_owned());
+        assert!(matches!(
+            classify_initialization_error("postgresql://user@example.com/store", &connection_error),
+            BackendError::Transient(message) if message.contains("connection refused")
+        ));
+    }
 
     /// A client-cert mTLS config the response-store filter accepts must also
     /// pass factory validation: the factory runs the same TLS check.
