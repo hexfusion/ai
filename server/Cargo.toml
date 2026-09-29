@@ -76,6 +76,7 @@ clap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 notify = { workspace = true }
+percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-filters = { workspace = true }
 praxis-ai-apis = { workspace = true }

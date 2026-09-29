@@ -15,6 +15,7 @@ workspace = true
 praxis-ai-store = { path = "../store" }
 dashmap = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 praxis-ai-store = { path = "../store", features = ["test-support"] }

@@ -4,6 +4,7 @@
 //! [`SqliteResponseStore`] — `SQLite` backend for the response store.
 
 use async_trait::async_trait;
+use percent_encoding::percent_decode_str;
 use praxis_ai_store::StateOwner;
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
@@ -221,14 +222,21 @@ fn sqlite_pool_options(database_url: &str, pool_config: Option<&PoolConfig>) -> 
 
 /// Return whether the database URL targets an in-memory `SQLite` database.
 fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    let query = url.split_once('?').map_or("", |(_, q)| q);
-    query
-        .split('&')
-        .any(|param| param == "mode=memory" || param.starts_with("mode=memory&"))
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Fetch column names for a `SQLite` table via `PRAGMA table_info`.
@@ -1559,6 +1567,22 @@ mod tests {
             is_memory_database_url("sqlite://:memory:"),
             "slash-form memory URL should be detected"
         );
+    }
+
+    #[test]
+    fn memory_url_forms_with_query_parameters() {
+        for url in [
+            ":memory:",
+            "sqlite://file::memory:",
+            "sqlite://%3Amemory%3A",
+            "sqlite::memory:?cache=shared",
+            "sqlite://:memory:?cache=shared",
+        ] {
+            assert!(
+                is_memory_database_url(url),
+                "memory URL with query parameters should be detected: {url}"
+            );
+        }
     }
 
     #[test]

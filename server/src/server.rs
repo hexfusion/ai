@@ -116,7 +116,9 @@ fn boot_server(
     let _cert_shutdowns = register_protocols(&mut server, &config, &state.pipelines);
     register_admin_endpoints(&mut server, &config, health_registry, &state.kv_stores);
 
-    // Provision response-store backends on the serving runtime, before run().
+    // Provision response-store backends as a serving-runtime startup service.
+    // The service holds Pingora's ready notifier until every initial pool is
+    // open and exits startup on a terminal failure.
     #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
     if let Some(service) = state.store_service.take() {
         server

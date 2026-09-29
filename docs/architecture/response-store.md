@@ -66,6 +66,9 @@ and validates the replacement generation first, the watcher atomically swaps
 pipelines only after it succeeds, and the old generation retains its leases
 until request-held pipeline references drain. Identical configurations reuse
 the cached pool; changed configurations retire the previous pool after drain.
+Expanding an active in-memory SQLite Responses store into a combined Responses
+and Conversations topology requires a restart. A replacement pool would be a
+different transient database and would otherwise lose the active store state.
 
 ## Request Phases
 
@@ -133,9 +136,15 @@ filter. Each backend factory validates its typed configuration before pool
 creation. The lifecycle cache retries `BackendError::Transient` within a
 bounded attempt budget; exhaustion becomes terminal `Unavailable`. Invalid
 configuration, unsupported schemas, and other permanent initialization
-failures are terminal immediately and are not retried forever. Aggregate store
+failures are terminal immediately and are not retried forever. Concurrent cold
+misses for the same effective backend key share one singleflight build, so a
+generation never opens duplicate pools for matching listeners. Aggregate store
 readiness becomes ready only after every configured listener owns a live
-generation lease. Pool opening and schema preparation have a 30-second
+generation lease. A terminal initial-generation failure rejects process
+startup with the backend diagnostic instead of leaving listeners alive behind
+persistent 503 responses. A later reload provisioning failure rejects only the
+candidate generation; the active generation keeps serving and a subsequent
+reload can retry. Pool opening and schema preparation have a 30-second
 end-to-end deadline so a database lock cannot block reload or shutdown
 indefinitely.
 
@@ -145,13 +154,15 @@ indefinitely.
 
 File-backed or in-memory. In-memory databases use a
 single-connection pool to avoid cross-connection
-isolation. JSON columns stored as `TEXT`.
+isolation. Response payload columns use `BLOB`, allowing the configured
+compression layer to store encoded bytes without text conversion.
 
 ### PostgreSQL
 
-Connection-pooled via `sqlx::PgPool`. Upsert uses
-`ON CONFLICT (tenant_id, id) DO UPDATE SET ...` for
-idempotent persistence. Supports configurable
+Connection-pooled via `sqlx::PgPool`. Response payload columns use `BYTEA`.
+Upsert uses `ON CONFLICT (id) DO UPDATE` and updates only when the stored and
+incoming owner triples match, preserving globally unique response IDs without
+allowing ownership changes. Supports configurable
 `SslMode` (`disable`, `prefer`, `require`,
 `verify-ca`, `verify-full`), custom root CA
 certificates, and client-certificate (mutual TLS)
@@ -167,13 +178,15 @@ opts in for development. Host validation is re-run
 on every connection attempt to guard against DNS
 rebinding.
 
-## Tenant Isolation
+## Ownership Isolation
 
-Every query is scoped by `tenant_id`. The composite
-primary key `(tenant_id, id)` enforces isolation at
-the database level. `get_response` returns `None` for
-wrong-tenant lookups to prevent information leakage.
-Single-tenant deployments use a `"default"` sentinel.
+Every read, write, and delete is scoped by the complete trusted owner identity:
+`tenant_id`, `owner_issuer`, and `owner_subject`. Responses and conversations
+use globally unique resource IDs; owner-preserving conflict predicates reject
+an attempt to reuse an existing ID under another owner. Conversation items use
+an owner-qualified composite key. Lookups return `None` for a mismatched owner
+to prevent information leakage. Single-tenant deployments use a `"default"`
+tenant sentinel while retaining issuer and subject isolation.
 
 ## Body Buffering
 

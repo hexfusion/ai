@@ -272,14 +272,21 @@ fn reject_postgres_fields(cfg: &ResponseStoreConfig) -> Result<(), FilterError> 
 
 /// Return whether a SQLite URL targets an in-memory database.
 fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    url.split_once('?')
-        .map_or("", |(_, query)| query)
-        .split('&')
-        .any(|param| param == "mode=memory")
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Extract the file path component from a SQLite URL.

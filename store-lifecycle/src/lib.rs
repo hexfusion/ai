@@ -12,7 +12,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use dashmap::{DashMap, mapref::entry::Entry as MapEntry};
@@ -21,6 +24,7 @@ use praxis_ai_store::{
     StoreRegistry,
 };
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 /// A store a pipeline requires: a registry name, the backend kind, and the
 /// inline configuration the factory interprets.
@@ -102,6 +106,44 @@ struct CacheKey {
     config: EffectiveConfigKey,
 }
 
+/// One cold-build singleflight and the terminal result shared by its waiters.
+struct InitializerState {
+    /// Winner error retained until every participant in this wave observes it.
+    outcome: Mutex<Option<BackendError>>,
+    /// Futures that joined this wave, including ones waiting for the mutex.
+    participants: AtomicUsize,
+}
+
+/// Shared handle to one cold-build wave.
+type Initializer = Arc<InitializerState>;
+
+/// One participant in a cold-build wave.
+///
+/// Dropping this guard also handles task cancellation. The last participant
+/// removes the wave only when no new participant joined before cleanup.
+struct InitializerParticipant {
+    /// Effective backend key whose wave this future joined.
+    key: CacheKey,
+    /// Initialization state shared by every participant in the wave.
+    initializer: Initializer,
+    /// Map from which the last participant removes the completed wave.
+    initializers: Arc<DashMap<CacheKey, Initializer>>,
+}
+
+impl Drop for InitializerParticipant {
+    fn drop(&mut self) {
+        if self.initializer.participants.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if let MapEntry::Occupied(entry) = self.initializers.entry(self.key.clone())
+            && Arc::ptr_eq(entry.get(), &self.initializer)
+            && entry.get().participants.load(Ordering::Acquire) == 0
+        {
+            entry.remove();
+        }
+    }
+}
+
 /// Process-wide, refcounted cache of provisioned backends.
 ///
 /// Identical effective configurations share one backend and one pool. A backend
@@ -109,6 +151,9 @@ struct CacheKey {
 pub struct BackendCache {
     /// Shared, process-wide cache of provisioned backends.
     entries: Arc<DashMap<CacheKey, CachedBackend>>,
+    /// Per-key initialization state that coalesces concurrent cold misses.
+    /// A terminal winner error is retained until its queued waiters observe it.
+    initializers: Arc<DashMap<CacheKey, Initializer>>,
     /// Injected factories, keyed by backend id.
     factories: HashMap<Arc<str>, Arc<dyn StoreBackendFactory>>,
     /// Bounded retry budget for transient build failures.
@@ -175,6 +220,7 @@ impl BackendCache {
         let factories = factories.into_iter().map(|f| (Arc::from(f.backend_id()), f)).collect();
         Self {
             entries: Arc::new(DashMap::new()),
+            initializers: Arc::new(DashMap::new()),
             factories,
             retry,
         }
@@ -290,6 +336,10 @@ impl BackendCache {
     }
 
     /// Resolve one reference to a backend, reusing a cached entry or building.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cache lookup, per-key singleflight, build, and registration form one resolution path"
+    )]
     async fn resolve(
         &self,
         r: &StoreRef,
@@ -318,16 +368,56 @@ impl BackendCache {
             return Ok(backend);
         }
 
-        // Build outside any map lock, with a bounded transient retry.
-        let built = self
-            .build_with_retry(factory.as_ref(), &r.config)
-            .await
-            .map_err(|source| ProvisionError::Backend {
+        // Serialize cold initialization per effective key. A listener that
+        // arrived while the winner was building rechecks the cache after the
+        // lock, so it reuses that pool instead of opening a duplicate or
+        // propagating a redundant build failure.
+        let participant = self.initializer(&ckey);
+        let mut guard = participant.initializer.outcome.lock().await;
+        if let Some(backend) = self.reuse(&ckey, this_gen, held) {
+            drop(guard);
+            return Ok(backend);
+        }
+        if let Some(source) = guard.as_ref().cloned() {
+            drop(guard);
+            return Err(ProvisionError::Backend {
                 name: Arc::clone(&r.name),
                 source,
-            })?;
+            });
+        }
 
-        Ok(self.insert_or_reuse(ckey, built, this_gen, held).await)
+        let built = match self.build_with_retry(factory.as_ref(), &r.config).await {
+            Ok(built) => built,
+            Err(source) => {
+                *guard = Some(source.clone());
+                drop(guard);
+                return Err(ProvisionError::Backend {
+                    name: Arc::clone(&r.name),
+                    source,
+                });
+            },
+        };
+        let backend = self.insert_or_reuse(ckey.clone(), built, this_gen, held).await;
+        drop(guard);
+        Ok(backend)
+    }
+
+    /// Return the shared initialization lock for one effective backend key.
+    fn initializer(&self, ckey: &CacheKey) -> InitializerParticipant {
+        let entry = self.initializers.entry(ckey.clone()).or_insert_with(|| {
+            Arc::new(InitializerState {
+                outcome: Mutex::new(None),
+                participants: AtomicUsize::new(0),
+            })
+        });
+        let initializer = Arc::clone(entry.value());
+        initializer.participants.fetch_add(1, Ordering::Relaxed);
+        drop(entry);
+        InitializerParticipant {
+            key: ckey.clone(),
+            initializer,
+            initializers: Arc::clone(&self.initializers),
+        }
     }
 
     /// Reuse a cached backend if present, taking one refcount per generation.
@@ -440,11 +530,15 @@ async fn release_into(entries: &DashMap<CacheKey, CachedBackend>, keys: &[CacheK
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
     use praxis_ai_store::memory::InMemoryStore;
     use serde_json::json;
+    use tokio::sync::{Barrier, Semaphore};
 
     use super::*;
 
@@ -481,6 +575,16 @@ mod tests {
         retires: Arc<AtomicUsize>,
         /// What each build does.
         behavior: Behavior,
+    }
+
+    /// Factory whose first cold build succeeds and any duplicate fails.
+    struct SingleflightFactory {
+        /// Number of build calls that reached the factory.
+        builds: Arc<AtomicUsize>,
+        /// Gate keeping the first build cold while a second caller arrives.
+        release: Semaphore,
+        /// Whether build one succeeds and later builds fail, or vice versa.
+        first_build_succeeds: bool,
     }
 
     impl FakeFactory {
@@ -534,8 +638,42 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl StoreBackendFactory for SingleflightFactory {
+        fn backend_id(&self) -> &str {
+            "singleflight"
+        }
+
+        fn effective_key(&self, _config: &Value) -> Result<EffectiveConfigKey, BackendError> {
+            Ok(EffectiveConfigKey::new("shared"))
+        }
+
+        async fn build(&self, _config: &Value) -> Result<ProvisionedBackend, BackendError> {
+            let attempt = self.builds.fetch_add(1, Ordering::SeqCst) + 1;
+            self.release
+                .acquire()
+                .await
+                .map_err(|_closed| BackendError::Unavailable("test release gate closed".to_owned()))?
+                .forget();
+            if (attempt == 1) != self.first_build_succeeds {
+                return Err(BackendError::Unavailable("singleflight winner failed".to_owned()));
+            }
+            Ok(ProvisionedBackend {
+                backend: Arc::new(InMemoryStore::new()),
+                retire: Arc::new(CountingRetire {
+                    retires: Arc::new(AtomicUsize::new(0)),
+                }),
+            })
+        }
+    }
+
     /// Erase a fake factory to a trait object (implicit unsizing, no cast).
     fn as_dyn(factory: Arc<FakeFactory>) -> Arc<dyn StoreBackendFactory> {
+        factory
+    }
+
+    /// Erase a singleflight factory while retaining its concrete test handle.
+    fn singleflight_as_dyn(factory: Arc<SingleflightFactory>) -> Arc<dyn StoreBackendFactory> {
         factory
     }
 
@@ -699,6 +837,191 @@ mod tests {
         assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
         assert!(provisioned.registry.contains("responses"));
         assert!(provisioned.registry.contains("conversations"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the concurrency regression coordinates two cold provisions and verifies both leases"
+    )]
+    async fn concurrent_cold_misses_share_the_winning_build() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(SingleflightFactory {
+            builds: Arc::clone(&builds),
+            release: Semaphore::new(0),
+            first_build_succeeds: true,
+        });
+        let factory_dyn = singleflight_as_dyn(Arc::clone(&factory));
+        let cache = Arc::new(BackendCache::new(vec![factory_dyn]));
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.provision(&[store_ref("first", "singleflight", "unused")]).await }
+        });
+        while builds.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let second_started = Arc::new(Barrier::new(2));
+        let second = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let second_started = Arc::clone(&second_started);
+            async move {
+                second_started.wait().await;
+                cache.provision(&[store_ref("second", "singleflight", "unused")]).await
+            }
+        });
+        second_started.wait().await;
+        let mut waiter_observed = false;
+        for _ in 0..1_000 {
+            waiter_observed = cache
+                .initializers
+                .iter()
+                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2);
+            if waiter_observed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(waiter_observed, "second provision must wait on the cold build");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "only the singleflight winner may build"
+        );
+
+        // One permit releases the only factory call; the waiting provision then
+        // rechecks the cache and shares its backend.
+        factory.release.add_permits(1);
+        let first = first.await.expect("first provision task").expect("winning provision");
+        let second = second.await.expect("second provision task").expect("waiting provision");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(first.registry.contains("first"));
+        assert!(second.registry.contains("second"));
+        first.lease.release().await;
+        second.lease.release().await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the concurrent failure wave and later retry are one lifecycle proof"
+    )]
+    async fn concurrent_waiters_share_winner_failure_then_later_call_retries() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(SingleflightFactory {
+            builds: Arc::clone(&builds),
+            release: Semaphore::new(0),
+            first_build_succeeds: false,
+        });
+        let cache = Arc::new(BackendCache::new(vec![singleflight_as_dyn(Arc::clone(&factory))]));
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.provision(&[store_ref("first", "singleflight", "unused")]).await }
+        });
+        while builds.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.provision(&[store_ref("second", "singleflight", "unused")]).await }
+        });
+        let mut waiter_observed = false;
+        for _ in 0..1_000 {
+            waiter_observed = cache
+                .initializers
+                .iter()
+                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2);
+            if waiter_observed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(waiter_observed, "second provision must queue behind the failing winner");
+
+        factory.release.add_permits(1);
+        let first_error = first
+            .await
+            .expect("first provision task")
+            .err()
+            .expect("winner must fail");
+        let second_error = second
+            .await
+            .expect("second provision task")
+            .err()
+            .expect("waiter must share failure");
+        assert!(first_error.to_string().contains("singleflight winner failed"));
+        assert!(second_error.to_string().contains("singleflight winner failed"));
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a waiter must not start a second build"
+        );
+
+        factory.release.add_permits(1);
+        let recovered = cache
+            .provision(&[store_ref("later", "singleflight", "unused")])
+            .await
+            .expect("a later generation may retry after the failed wave");
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        recovered.lease.release().await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cancellation and immediate recovery sequence form one lifecycle proof"
+    )]
+    async fn cancelled_waiter_does_not_pin_a_failed_singleflight_wave() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(SingleflightFactory {
+            builds: Arc::clone(&builds),
+            release: Semaphore::new(0),
+            first_build_succeeds: false,
+        });
+        let cache = Arc::new(BackendCache::new(vec![singleflight_as_dyn(Arc::clone(&factory))]));
+        let winner = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.provision(&[store_ref("winner", "singleflight", "unused")]).await }
+        });
+        while builds.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let waiter = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.provision(&[store_ref("waiter", "singleflight", "unused")]).await }
+        });
+        for _ in 0..1_000 {
+            if cache
+                .initializers
+                .iter()
+                .any(|entry| entry.value().participants.load(Ordering::Acquire) >= 2)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            cache
+                .initializers
+                .iter()
+                .map(|entry| entry.value().participants.load(Ordering::Acquire))
+                .max(),
+            Some(2),
+            "waiter must join the winner's wave"
+        );
+
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+        factory.release.add_permits(1);
+        assert!(winner.await.expect("winner task").is_err());
+
+        factory.release.add_permits(1);
+        let recovered = cache
+            .provision(&[store_ref("later", "singleflight", "unused")])
+            .await
+            .expect("a later generation retries immediately after cancellation");
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        recovered.lease.release().await;
     }
 
     #[tokio::test]
